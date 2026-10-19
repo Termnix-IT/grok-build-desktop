@@ -72,6 +72,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 ## 版と Git
 
-開発βの版は v0.0.1 です。版を上げるときは `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json` を同じ番号にします。
+機能追加とバグ修正は `claude/` で始まる作業ブランチにコミットして積みます。作業ブランチは push してよいです。`main` への merge、版番号の更新、タグ、prerelease、インストーラの公開は、ユーザーがその反映を判断したときだけ行います。一つの修正が終わるたびに `main` へ混ぜたり、版を上げたりしません。
 
-既定ブランチは `main` です。公開先は https://github.com/Termnix-IT/grok-build-desktop です。インストーラを配るときは、このリポジトリの prerelease に NSIS の成果物を置きます。`node_modules`、`dist`、`src-tauri/target` はコミットしません。
+ユーザーが反映を指示したときは、作業ブランチを `main` へ fast-forward で取り込み、その内容に対応する版へ上げます。版番号は `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json` で揃えます。Windows 用の NSIS インストーラを作り、タグと prerelease にその成果物を置きます。
+
+現在の開発βは v0.0.1 です。既定ブランチは `main` です。公開先は https://github.com/Termnix-IT/grok-build-desktop です。`node_modules`、`dist`、`src-tauri/target` はコミットしません。
