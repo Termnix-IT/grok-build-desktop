@@ -64,7 +64,14 @@ export interface PermissionRequest {
 }
 
 export type TranscriptItem =
-  | { id: string; kind: "text"; role: "user" | "assistant" | "thought"; text: string; messageId?: string }
+  | {
+      id: string;
+      kind: "text";
+      role: "user" | "assistant" | "thought";
+      text: string;
+      messageId?: string;
+      images?: { id: string; name: string; preview: string }[];
+    }
   | { id: string; kind: "tool"; toolId: string; tool: ToolPayload }
   | { id: string; kind: "plan"; entries: PlanEntry[] }
   | { id: string; kind: "notice"; title: string; body: string }
@@ -94,6 +101,7 @@ export interface DeskState {
   permission: PermissionRequest | null;
   commands: { name: string; description: string }[];
   banner: string;
+  promptImage: boolean;
 }
 
 export const initialDesk: DeskState = {
@@ -119,6 +127,7 @@ export const initialDesk: DeskState = {
   permission: null,
   commands: [],
   banner: "",
+  promptImage: false,
 };
 
 const MODE_LABELS: Record<string, string> = {
@@ -176,6 +185,7 @@ export function reduceDesk(state: DeskState, event: Record<string, unknown>): De
         model: text(event.model) || state.model,
         contextTokens: number(event.contextTokens) || state.contextTokens,
         auth: false,
+        promptImage: Boolean(event.promptImage),
       };
     case "error":
       return {

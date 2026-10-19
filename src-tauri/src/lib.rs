@@ -34,8 +34,31 @@ async fn prompt(
     state: State<'_, AgentState>,
     text: String,
     files: Vec<String>,
+    image_ids: Vec<String>,
 ) -> Result<(), String> {
-    state.prompt(text, files).await
+    state.prompt(text, files, image_ids).await
+}
+
+#[tauri::command]
+fn stage_paths(
+    state: State<'_, AgentState>,
+    paths: Vec<String>,
+) -> Vec<agent::AttachmentRecord> {
+    state.stage_paths(paths)
+}
+
+#[tauri::command]
+fn stage_bytes(
+    state: State<'_, AgentState>,
+    name: String,
+    data_base64: String,
+) -> agent::AttachmentRecord {
+    state.stage_bytes(name, data_base64)
+}
+
+#[tauri::command]
+fn unstage(state: State<'_, AgentState>, id: String) {
+    state.unstage(id);
 }
 
 #[tauri::command]
@@ -105,6 +128,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let state = AgentState::start(app.handle().clone());
             app.manage(state);
@@ -117,6 +141,9 @@ pub fn run() {
             close_session,
             refresh_sessions,
             prompt,
+            stage_paths,
+            stage_bytes,
+            unstage,
             compact_session,
             cancel_turn,
             set_mode,

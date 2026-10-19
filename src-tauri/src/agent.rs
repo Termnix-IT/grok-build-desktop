@@ -1,7 +1,7 @@
 //! ACP host for one `grok agent --no-leader stdio` child.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,8 +23,9 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, watch, Notify};
 
 use crate::usage::{
-    context_window, current_model, foreign_owner, parse_active_sessions, prompt_blocks,
-    turn_reported_nothing, usage_from_value, used_tokens, TurnUsage,
+    classify_image_bytes, context_window, current_model, decode_image, encode_image,
+    foreign_owner, image_mime_from_name, load_path, parse_active_sessions, prompt_blocks,
+    turn_reported_nothing, usage_from_value, used_tokens, LoadedPath, OutgoingImage, TurnUsage,
 };
 
 const MODE_WAIT: Duration = Duration::from_millis(800);
@@ -36,7 +37,40 @@ pub struct AgentState {
     folder: Arc<Mutex<Option<PathBuf>>>,
     our_pid: Arc<Mutex<Option<u32>>>,
     mirror: Arc<Mutex<Mirror>>,
+    images: Arc<ImageStore>,
+    prompt_image: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct StagedImage {
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+struct ImageStore {
+    next: AtomicU64,
+    items: Mutex<HashMap<String, StagedImage>>,
+}
+
+impl ImageStore {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            items: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRecord {
+    pub kind: String,
+    pub id: Option<String>,
+    pub path: Option<String>,
+    pub name: String,
+    pub mime_type: Option<String>,
+    pub preview: Option<String>,
+    pub message: Option<String>,
 }
 
 enum Cmd {
@@ -45,7 +79,12 @@ enum Cmd {
     LoadSession { id: String, reply: Reply },
     CloseSession { reply: Reply },
     Refresh { reply: Reply },
-    Prompt { text: String, files: Vec<String>, reply: Reply },
+    Prompt {
+        text: String,
+        files: Vec<String>,
+        image_ids: Vec<String>,
+        reply: Reply,
+    },
     Compact { reply: Reply },
     Cancel { reply: Reply },
     SetMode { mode_id: String, reply: Reply },
@@ -140,6 +179,8 @@ struct Shared {
     permits: Permits,
     mode_tx: watch::Sender<(u64, Option<String>)>,
     mirror: Arc<Mutex<Mirror>>,
+    images: Arc<ImageStore>,
+    prompt_image: Arc<AtomicBool>,
 }
 
 enum End {
@@ -155,11 +196,15 @@ impl AgentState {
         let folder = Arc::new(Mutex::new(None));
         let our_pid = Arc::new(Mutex::new(None));
         let mirror = Arc::new(Mutex::new(Mirror::default()));
+        let images = Arc::new(ImageStore::new());
+        let prompt_image = Arc::new(AtomicBool::new(false));
         let thread_wake = wake.clone();
         let thread_shutdown = shutdown.clone();
         let thread_folder = folder.clone();
         let thread_pid = our_pid.clone();
         let thread_mirror = mirror.clone();
+        let thread_images = images.clone();
+        let thread_prompt_image = prompt_image.clone();
         let join = std::thread::Builder::new()
             .name("grok-acp".into())
             .spawn(move || {
@@ -171,6 +216,8 @@ impl AgentState {
                     thread_folder,
                     thread_pid,
                     thread_mirror,
+                    thread_images,
+                    thread_prompt_image,
                 )
             })
             .expect("acp thread");
@@ -181,6 +228,8 @@ impl AgentState {
             folder,
             our_pid,
             mirror,
+            images,
+            prompt_image,
             join: Mutex::new(Some(join)),
         }
     }
@@ -239,9 +288,99 @@ impl AgentState {
         self.roundtrip(|reply| Cmd::Refresh { reply }).await
     }
 
-    pub async fn prompt(&self, text: String, files: Vec<String>) -> Result<(), String> {
-        self.roundtrip(|reply| Cmd::Prompt { text, files, reply })
-            .await
+    pub async fn prompt(
+        &self,
+        text: String,
+        files: Vec<String>,
+        image_ids: Vec<String>,
+    ) -> Result<(), String> {
+        self.roundtrip(|reply| Cmd::Prompt {
+            text,
+            files,
+            image_ids,
+            reply,
+        })
+        .await
+    }
+
+    pub fn stage_paths(&self, paths: Vec<String>) -> Vec<AttachmentRecord> {
+        paths
+            .into_iter()
+            .map(|path| self.stage_one_path(path))
+            .collect()
+    }
+
+    pub fn stage_bytes(&self, name: String, data_base64: String) -> AttachmentRecord {
+        if !self.prompt_image.load(Ordering::Relaxed) {
+            return rejected(name, "この Grok は画像入力を告知していません");
+        }
+        let Some(expected) = image_mime_from_name(&name) else {
+            return rejected(name, "png、jpeg、gif、webp だけを画像として添付できます");
+        };
+        let bytes = match decode_image(&data_base64) {
+            Ok(bytes) => bytes,
+            Err(message) => return rejected(name, message),
+        };
+        let mime = match classify_image_bytes(&name, expected, &bytes) {
+            Ok(mime) => mime.to_string(),
+            Err(message) => return rejected(name, message),
+        };
+        self.store_image(name, mime, bytes, None)
+    }
+
+    pub fn unstage(&self, id: String) {
+        lock(&self.images.items).remove(&id);
+    }
+
+    fn stage_one_path(&self, path: String) -> AttachmentRecord {
+        match load_path(Path::new(&path)) {
+            Ok(LoadedPath::Other { path }) => {
+                let name = file_name_of(&path);
+                AttachmentRecord {
+                    kind: "file".into(),
+                    id: None,
+                    path: Some(path),
+                    name,
+                    mime_type: None,
+                    preview: None,
+                    message: None,
+                }
+            }
+            Ok(LoadedPath::Image { name, mime, bytes }) => {
+                if !self.prompt_image.load(Ordering::Relaxed) {
+                    return rejected(name, "この Grok は画像入力を告知していません");
+                }
+                self.store_image(name, mime, bytes, Some(path))
+            }
+            Err(message) => rejected(file_name_of(&path), message),
+        }
+    }
+
+    fn store_image(
+        &self,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+        path: Option<String>,
+    ) -> AttachmentRecord {
+        let id = self.images.next.fetch_add(1, Ordering::Relaxed).to_string();
+        let preview = format!("data:{mime};base64,{}", encode_image(&bytes));
+        lock(&self.images.items).insert(
+            id.clone(),
+            StagedImage {
+                mime: mime.clone(),
+                bytes,
+            },
+        );
+        AttachmentRecord {
+            kind: "image".into(),
+            id: Some(id),
+            path,
+            name,
+            mime_type: Some(mime),
+            preview: Some(preview),
+            message: None,
+        }
     }
 
     pub async fn compact(&self) -> Result<(), String> {
@@ -305,6 +444,27 @@ pub fn owner_warning(session_id: &str, our_pid: Option<u32>) -> Option<String> {
     })
 }
 
+fn rejected(name: String, message: impl Into<String>) -> AttachmentRecord {
+    AttachmentRecord {
+        kind: "rejected".into(),
+        id: None,
+        path: None,
+        name,
+        mime_type: None,
+        preview: None,
+        message: Some(message.into()),
+    }
+}
+
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 fn agent_thread(
     app: AppHandle,
     rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
@@ -313,6 +473,8 @@ fn agent_thread(
     folder: Arc<Mutex<Option<PathBuf>>>,
     our_pid: Arc<Mutex<Option<u32>>>,
     mirror: Arc<Mutex<Mirror>>,
+    images: Arc<ImageStore>,
+    prompt_image: Arc<AtomicBool>,
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -333,6 +495,8 @@ fn agent_thread(
             permits: Permits::new(),
             mode_tx,
             mirror,
+            images,
+            prompt_image,
         });
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -477,6 +641,10 @@ async fn initialize(
     if let Some(size) = context_window(&meta) {
         shared.window.store(size, Ordering::Relaxed);
     }
+    let prompt_image = response.agent_capabilities.prompt_capabilities.image;
+    shared
+        .prompt_image
+        .store(prompt_image, Ordering::Relaxed);
     emit(
         &shared,
         json!({
@@ -486,6 +654,7 @@ async fn initialize(
             "model": current_model(&meta),
             "contextTokens": shared.window.load(Ordering::Relaxed),
             "modelState": meta.get("modelState").cloned(),
+            "promptImage": prompt_image,
         }),
     );
     Ok(())
@@ -589,8 +758,22 @@ async fn dispatch(
             emit(&shared, json!({ "type": "session-closed" }));
             answer_publish(&shared, connection, reply).await
         }
-        Cmd::Prompt { text, files, reply } => {
-            run_prompt(shared, connection, session_id, text, files, reply).await
+        Cmd::Prompt {
+            text,
+            files,
+            image_ids,
+            reply,
+        } => {
+            run_prompt(
+                shared,
+                connection,
+                session_id,
+                text,
+                files,
+                image_ids,
+                reply,
+            )
+            .await
         }
         Cmd::Compact { reply } => {
             run_prompt(
@@ -598,6 +781,7 @@ async fn dispatch(
                 connection,
                 session_id,
                 "/compact".into(),
+                Vec::new(),
                 Vec::new(),
                 reply,
             )
@@ -728,16 +912,24 @@ async fn run_prompt(
     session_id: &Option<String>,
     text: String,
     files: Vec<String>,
+    image_ids: Vec<String>,
     reply: Reply,
 ) -> Result<(), agent_client_protocol::Error> {
     let Some(session) = session_id.clone() else {
         reply.send(Err("セッションがありません".into()));
         return Ok(());
     };
-    if text.trim().is_empty() {
+    if text.trim().is_empty() && image_ids.is_empty() {
         reply.send(Err("空のメッセージは送れません".into()));
         return Ok(());
     }
+    let images = match prepared_images(&shared, &image_ids) {
+        Ok(images) => images,
+        Err(message) => {
+            reply.send(Err(message));
+            return Ok(());
+        }
+    };
     if shared.busy.swap(true, Ordering::SeqCst) {
         reply.send(Err("応答の途中です。停止してから送ってください".into()));
         return Ok(());
@@ -745,10 +937,11 @@ async fn run_prompt(
     shared.saw_compaction.store(false, Ordering::SeqCst);
     shared.saw_agent_text.store(false, Ordering::SeqCst);
     emit(&shared, json!({ "type": "busy", "busy": true }));
-    let blocks = prompt_blocks(&text, &files);
+    let blocks = prompt_blocks(&text, &files, &images);
     let prompt_connection = connection.clone();
     let task_shared = shared.clone();
     let slash = slash_kind(&text).map(str::to_string);
+    let sent_image_ids = image_ids.clone();
     let spawned = connection.spawn(async move {
         let result = prompt_connection
             .send_request(PromptRequest::new(SessionId::new(session), blocks))
@@ -756,6 +949,12 @@ async fn run_prompt(
             .await;
         match result {
             Ok(response) => {
+                {
+                    let mut staged = lock(&task_shared.images.items);
+                    for id in &sent_image_ids {
+                        staged.remove(id);
+                    }
+                }
                 let usage = response.meta.as_ref().and_then(|meta| {
                     usage_from_value(&Value::Object(meta.clone()))
                 });
@@ -994,8 +1193,30 @@ fn block_text(block: &ContentBlock) -> String {
     match block {
         ContentBlock::Text(text) => text.text.clone(),
         ContentBlock::ResourceLink(link) => link.name.clone(),
+        ContentBlock::Image(_) => "（画像）".to_string(),
         _ => String::new(),
     }
+}
+
+fn prepared_images(shared: &Shared, ids: &[String]) -> Result<Vec<OutgoingImage>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !shared.prompt_image.load(Ordering::Relaxed) {
+        return Err("この Grok は画像入力を告知していません".into());
+    }
+    let staged = lock(&shared.images.items);
+    let mut images = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(image) = staged.get(id) else {
+            return Err("添付した画像が見つかりません。もう一度ドロップしてください".into());
+        };
+        images.push(OutgoingImage {
+            mime_type: image.mime.clone(),
+            data: encode_image(&image.bytes),
+        });
+    }
+    Ok(images)
 }
 
 async fn publish_sessions(

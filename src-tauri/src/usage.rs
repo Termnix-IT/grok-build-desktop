@@ -1,10 +1,13 @@
-//! Token usage, file links, and active-session parsing.
+//! Token usage, file links, image bytes, and active-session parsing.
 //! These functions do not launch Grok.
 
 use std::path::Path;
 
-use agent_client_protocol::schema::v1::{ContentBlock, ResourceLink, TextContent};
+use agent_client_protocol::schema::v1::{ContentBlock, ImageContent, ResourceLink, TextContent};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{Map, Value};
+
+pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnUsage {
@@ -166,7 +169,114 @@ fn encode_path(text: &str) -> String {
     uri
 }
 
-pub fn prompt_blocks(text: &str, files: &[String]) -> Vec<ContentBlock> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingImage {
+    pub mime_type: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedPath {
+    Image {
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    Other {
+        path: String,
+    },
+}
+
+pub fn encode_image(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
+fn encoded_image_limit() -> u64 {
+    (MAX_IMAGE_BYTES + 2) / 3 * 4
+}
+
+pub fn decode_image(data: &str) -> Result<Vec<u8>, String> {
+    let data = data.trim();
+    if data.len() as u64 > encoded_image_limit() {
+        return Err("画像は 8MiB を超えているため添付できません".into());
+    }
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| "画像データを読めません".to_string())?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err("画像は 8MiB を超えているため添付できません".into());
+    }
+    Ok(bytes)
+}
+
+pub fn image_mime_from_name(name: &str) -> Option<&'static str> {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+pub fn classify_image_bytes<'a>(
+    name: &str,
+    expected: &'a str,
+    bytes: &[u8],
+) -> Result<&'a str, String> {
+    let Some(actual) = mime_from_magic(bytes) else {
+        return Err(format!("{name} は画像として読めません"));
+    };
+    if actual != expected {
+        return Err(format!("{name} の中身が拡張子と一致しません"));
+    }
+    Ok(expected)
+}
+
+pub fn load_path(path: &Path) -> Result<LoadedPath, String> {
+    let text = path.to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(text.as_str())
+        .to_string();
+    let meta = std::fs::metadata(path).map_err(|_| format!("{name} を読めません"))?;
+    if !meta.is_file() {
+        return Err(format!("{name} はファイルではありません"));
+    }
+    let Some(expected) = image_mime_from_name(&name) else {
+        return Ok(LoadedPath::Other { path: text });
+    };
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(format!("{name} は 8MiB を超えているため添付できません"));
+    }
+    let bytes = std::fs::read(path).map_err(|_| format!("{name} を読めません"))?;
+    let mime = classify_image_bytes(&name, expected, &bytes)?.to_string();
+    Ok(LoadedPath::Image { name, mime, bytes })
+}
+
+pub fn prompt_blocks(text: &str, files: &[String], images: &[OutgoingImage]) -> Vec<ContentBlock> {
     let mut blocks = vec![ContentBlock::Text(TextContent::new(text))];
     for file in files {
         let path = Path::new(file);
@@ -178,6 +288,12 @@ pub fn prompt_blocks(text: &str, files: &[String]) -> Vec<ContentBlock> {
         blocks.push(ContentBlock::ResourceLink(ResourceLink::new(
             name,
             file_uri(file),
+        )));
+    }
+    for image in images {
+        blocks.push(ContentBlock::Image(ImageContent::new(
+            image.data.clone(),
+            image.mime_type.clone(),
         )));
     }
     blocks
@@ -343,13 +459,73 @@ mod tests {
 
     #[test]
     fn prompt_blocks_use_resource_links_for_files() {
-        let blocks = prompt_blocks("見て", &[r"C:\work\a b.txt".into()]);
+        let blocks = prompt_blocks("見て", &[r"C:\work\a b.txt".into()], &[]);
         let json = serde_json::to_value(&blocks).unwrap();
         assert_eq!(json[0]["type"], "text");
         assert_eq!(json[0]["text"], "見て");
         assert_eq!(json[1]["type"], "resource_link");
         assert_eq!(json[1]["name"], "a b.txt");
         assert_eq!(json[1]["uri"], "file:///C:/work/a%20b.txt");
+    }
+
+    #[test]
+    fn prompt_blocks_send_inline_images_without_a_file_uri() {
+        let blocks = prompt_blocks(
+            "",
+            &[r"C:\work\note.txt".into()],
+            &[OutgoingImage {
+                mime_type: "image/png".into(),
+                data: "aaaa".into(),
+            }],
+        );
+        let json = serde_json::to_value(&blocks).unwrap();
+        assert_eq!(json[0]["text"], "");
+        assert_eq!(json[1]["type"], "resource_link");
+        assert_eq!(json[2]["type"], "image");
+        assert_eq!(json[2]["mimeType"], "image/png");
+        assert_eq!(json[2]["data"], "aaaa");
+        assert!(json[2].get("uri").is_none());
+    }
+
+    #[test]
+    fn image_magic_must_match_the_extension() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        assert_eq!(
+            classify_image_bytes("shot.png", "image/png", png).unwrap(),
+            "image/png"
+        );
+        assert!(classify_image_bytes("shot.png", "image/png", b"\xff\xd8\xff").is_err());
+        assert!(classify_image_bytes("shot.png", "image/png", b"hello").is_err());
+        assert_eq!(image_mime_from_name("a.JPEG"), Some("image/jpeg"));
+        assert_eq!(image_mime_from_name("notes.txt"), None);
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&12u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(
+            classify_image_bytes("anim.webp", "image/webp", &webp).unwrap(),
+            "image/webp"
+        );
+        assert!(classify_image_bytes("anim.gif", "image/gif", b"GIF89a").is_ok());
+    }
+
+    #[test]
+    fn oversized_image_bytes_are_rejected() {
+        let huge = "A".repeat(encoded_image_limit() as usize + 1);
+        let error = decode_image(&huge).unwrap_err();
+        assert!(error.contains("8MiB"), "{error}");
+        assert!(decode_image("@@@@").unwrap_err().contains("読めません"));
+    }
+
+    #[test]
+    fn non_image_files_stay_paths() {
+        let path = std::env::temp_dir().join(format!("gbd-note-{}.txt", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        let loaded = load_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        match loaded {
+            LoadedPath::Other { path: text } => assert!(text.ends_with(".txt")),
+            LoadedPath::Image { .. } => panic!("text file was treated as an image"),
+        }
     }
 
     #[test]
