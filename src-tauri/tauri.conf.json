@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Grok Build Desktop",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "identifier": "com.grokbuild.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -25,7 +25,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU4QTE3MDUwNkRDNTM2MUMKUldRY05zVnRVSENoNktDRWdObElBNlZGQ21mUW1rcDlhc0g0M2E5Tnd1bnRIUzdiQ3ErQ2pQWTQK",
       "endpoints": [
         "https://raw.githubusercontent.com/Termnix-IT/grok-build-desktop/main/updates/latest.json"
       ],

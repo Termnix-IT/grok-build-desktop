@@ -76,13 +76,13 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 起動時には更新を確認しません。左下の設定から確認し、適用は確認ダイアログのあとだけ行います。開発中の `npm run tauri dev` では確認できても適用しません。Windows の `installMode` は `passive` で、適用するとアプリが終了してからインストーラが動きます。会話は Grok のセッションに残ります。
 
-確認先は `https://raw.githubusercontent.com/Termnix-IT/grok-build-desktop/main/updates/latest.json` です。GitHub の `/releases/latest` は使いません。公開済みの v0.0.1 にはこの更新機能が入っていないので、そのインストーラからアプリ内では更新できません。次に署名して公開した版から使います。
+確認先は `https://raw.githubusercontent.com/Termnix-IT/grok-build-desktop/main/updates/latest.json` です。GitHub の `/releases/latest` は使いません。公開済みの v0.0.1 にはこの更新機能が入っていないので、そのインストーラからアプリ内では更新できません。v0.0.2 を手で入れた版から、設定の適用が使えます。
 
-署名の公開鍵は、次に公開するとき `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` に入れます。今は空です。空のままでは確認が失敗し、画面は署名鍵が次の公開まで未設定であること、または公開された更新情報がまだないことを伝えます。秘密鍵は環境変数 `TAURI_SIGNING_PRIVATE_KEY` だけで渡し、リポジトリには置きません。仮の公開鍵は入れません。鍵はこの実装では作りません。
+署名の公開鍵は `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` にあります。秘密鍵とパスワードはリポジトリの外に置き、ビルド時だけ `TAURI_SIGNING_PRIVATE_KEY_PATH` と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` で渡します。秘密鍵の中身を `TAURI_SIGNING_PRIVATE_KEY` に渡しても同じです。別の公開鍵に差し替えると、すでに配った版は新しい署名を検証できません。
 
 公開するときは、次の順にします。
 
-1. `TAURI_SIGNING_PRIVATE_KEY` を設定する。
+1. `TAURI_SIGNING_PRIVATE_KEY_PATH` と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を設定する。
 2. `bundle.createUpdaterArtifacts` は `true` のまま、NSIS のインストーラを作る。`.exe` と `.exe.sig` が出ます。
 3. その 2 つを prerelease にアップロードする。
 4. `updates/latest.json` を `main` に置く。`version` は semver です。`platforms["windows-x86_64"].url` はインストーラの URL、`signature` は `.sig` ファイルの中身です。パスは書きません。
@@ -95,4 +95,4 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 ユーザーが反映を指示したときは、作業ブランチを `main` へ fast-forward で取り込み、その内容に対応する版へ上げます。版番号は `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json` で揃えます。Windows 用の NSIS インストーラを作り、タグと prerelease にその成果物を置きます。
 
-現在の開発βは v0.0.1 です。既定ブランチは `main` です。公開先は https://github.com/Termnix-IT/grok-build-desktop です。`node_modules`、`dist`、`src-tauri/target` はコミットしません。
+現在の開発βは v0.0.2 です。既定ブランチは `main` です。公開先は https://github.com/Termnix-IT/grok-build-desktop です。`node_modules`、`dist`、`src-tauri/target` はコミットしません。
