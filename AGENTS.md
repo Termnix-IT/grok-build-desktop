@@ -78,11 +78,11 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 確認先は `https://raw.githubusercontent.com/Termnix-IT/grok-build-desktop/main/updates/latest.json` です。GitHub の `/releases/latest` は使いません。公開済みの v0.0.1 にはこの更新機能が入っていないので、そのインストーラからアプリ内では更新できません。v0.0.2 を手で入れた版から、設定の適用が使えます。
 
-署名の公開鍵は `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` にあります。秘密鍵とパスワードはリポジトリの外に置き、ビルド時だけ `TAURI_SIGNING_PRIVATE_KEY_PATH` と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` で渡します。秘密鍵の中身を `TAURI_SIGNING_PRIVATE_KEY` に渡しても同じです。別の公開鍵に差し替えると、すでに配った版は新しい署名を検証できません。
+署名の公開鍵は `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` にあります。秘密鍵とパスワードはリポジトリの外に置きます。ビルド時は `TAURI_SIGNING_PRIVATE_KEY` に秘密鍵のパスか中身を渡し、パスワードがあるときは `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` も渡します。`TAURI_SIGNING_PRIVATE_KEY_PATH` だけでは署名されません。別の公開鍵に差し替えると、すでに配った版は新しい署名を検証できません。
 
 公開するときは、次の順にします。
 
-1. `TAURI_SIGNING_PRIVATE_KEY_PATH` と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を設定する。
+1. `TAURI_SIGNING_PRIVATE_KEY` と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を設定する。
 2. `bundle.createUpdaterArtifacts` は `true` のまま、NSIS のインストーラを作る。`.exe` と `.exe.sig` が出ます。
 3. その 2 つを prerelease にアップロードする。
 4. `updates/latest.json` を `main` に置く。`version` は semver です。`platforms["windows-x86_64"].url` はインストーラの URL、`signature` は `.sig` ファイルの中身です。パスは書きません。
