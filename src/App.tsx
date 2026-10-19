@@ -53,6 +53,7 @@ export default function App() {
   const [pendingLoad, setPendingLoad] = useState<{ id: string; warning: string } | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
 
   useEffect(() => {
@@ -89,6 +90,13 @@ export default function App() {
     box.scrollTop = box.scrollHeight;
   }, [desk.items, desk.permission, desk.busy]);
 
+  useEffect(() => {
+    const field = inputRef.current;
+    if (!field) return;
+    field.style.height = "0px";
+    field.style.height = `${Math.min(180, Math.max(48, field.scrollHeight))}px`;
+  }, [draft, desk.sessionId]);
+
   const atMatch = draft.match(/(^|\s)@([^\s@]*)$/);
   const atQuery = atMatch?.[2] ?? null;
 
@@ -114,6 +122,7 @@ export default function App() {
   }, [atQuery, folder]);
 
   const gauge = freePercent(desk.usage, desk.contextTokens);
+  const usedPercent = gauge ? Math.max(0, 100 - gauge.percent) : 0;
   const modes = useMemo(() => modeChoices(desk), [desk]);
   const planEntries = [...desk.items].reverse().find((item) => item.kind === "plan");
 
@@ -185,6 +194,16 @@ export default function App() {
     setFiles((current) => (current.includes(path) ? current : [...current, path]));
     setDraft((current) => current.replace(/(^|\s)@[^\s@]*$/, "$1").trimEnd());
     setSuggestions([]);
+    inputRef.current?.focus();
+  }
+
+  function insertAt() {
+    setDraft((current) => {
+      if (/(^|\s)@$/.test(current)) return current;
+      const gap = current.length === 0 || /\s$/.test(current) ? "" : " ";
+      return `${current}${gap}@`;
+    });
+    inputRef.current?.focus();
   }
 
   function toggleTool(id: string) {
@@ -201,13 +220,19 @@ export default function App() {
     <div className="desk">
       <aside className="rail">
         <div className="mark">
-          <p className="eyebrow">Grok Build</p>
-          <h1>机の上の<br />セッション</h1>
+          <span className="logo-mark" aria-hidden="true">G</span>
+          <div>
+            <p className="product">Grok Build</p>
+            <p className="status">
+              <i className={desk.ready ? "dot on" : "dot"} />
+              {desk.ready ? "接続済み" : "起動しています"}
+            </p>
+          </div>
         </div>
-        <button className="solid" type="button" onClick={() => void browseFolder()}>
-          フォルダを選ぶ
+        <button className="folder-pick" type="button" onClick={() => void browseFolder()}>
+          <span>フォルダを選ぶ</span>
+          <small>{folderName || "プロジェクトを開く"}</small>
         </button>
-        {folderName && <p className="folder-name">{folderName}</p>}
         <div className="recent">
           {recent.map((path) => (
             <button key={path} type="button" className={path === folder ? "recent on" : "recent"} onClick={() => void chooseFolder(path)}>
@@ -223,10 +248,10 @@ export default function App() {
         </div>
         <ul className="sessions">
           {desk.sessions.map((session) => (
-            <li key={session.sessionId}>
+            <li key={session.sessionId} className={session.sessionId === desk.sessionId ? "session-row on" : "session-row"}>
               <button
                 type="button"
-                className={session.sessionId === desk.sessionId ? "session on" : "session"}
+                className="session"
                 onClick={() => void openSession(session.sessionId)}
               >
                 <strong>{session.title || "無題"}</strong>
@@ -247,193 +272,233 @@ export default function App() {
 
       <main className="stage">
         <header className="stage-bar">
-          <div>
-            <p className="eyebrow">{desk.ready ? desk.agentVersion || "接続済み" : "エージェントを起動しています"}</p>
-            <h2>{desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title || (desk.sessionId ? "無題の会話" : "会話はまだ開いていません")}</h2>
-          </div>
-          <label className="mode">
-            <span>{desk.modeConfirmed ? "権限" : "権限（未確認）"}</span>
-            <select
-              value={desk.modeId}
-              disabled={!desk.sessionId || desk.busy}
-              onChange={(event) => {
-                const modeId = event.target.value;
-                void invoke("set_mode", { modeId }).catch((error) => setDesk((current) => ({ ...current, error: String(error) })));
-              }}
-            >
-              {modes.map((mode) => (
-                <option key={mode.id} value={mode.id}>{mode.label}</option>
-              ))}
-            </select>
-          </label>
+          <h2>{desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title || (desk.sessionId ? "無題の会話" : "会話はまだ開いていません")}</h2>
+          <p className="conn">
+            <i className={desk.ready ? "dot on" : "dot"} />
+            {desk.ready ? desk.agentVersion || "接続済み" : "起動しています"}
+          </p>
         </header>
 
-        {desk.warning && <p className="banner warn">{desk.warning} ファイルの巻き戻しはしません。</p>}
-        {desk.banner && <p className="banner">{desk.banner}</p>}
-        {desk.error && (
-          <p className="banner warn">
-            {desk.error}
-            {desk.auth && (
-              <button type="button" onClick={() => void invoke("login")}>ログイン</button>
-            )}
-          </p>
-        )}
-
-        <div
-          className="transcript"
-          ref={transcriptRef}
-          onScroll={(event) => {
-            const box = event.currentTarget;
-            stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-          }}
-        >
-          {!folder && (
-            <section className="empty">
-              <p className="eyebrow">作業フォルダ</p>
-              <h3>どのプロジェクトの机にするか選んでください。</h3>
-              <p>会話の正本は Grok のセッションに残ります。このアプリはそれを写し取りません。</p>
-              <button className="solid" type="button" onClick={() => void browseFolder()}>フォルダを選ぶ</button>
-            </section>
+        <div className="sheet">
+          {desk.warning && <p className="banner warn">{desk.warning} ファイルの巻き戻しはしません。</p>}
+          {desk.banner && <p className="banner">{desk.banner}</p>}
+          {desk.error && (
+            <p className="banner warn">
+              {desk.error}
+              {desk.auth && (
+                <button type="button" onClick={() => void invoke("login")}>ログイン</button>
+              )}
+            </p>
           )}
-          {folder && !desk.sessionId && !desk.loading && (
-            <section className="empty">
-              <h3>{folderName} で新しい会話を始められます。</h3>
-              <p>左の一覧から過去の会話を開くこともできます。開いているターミナルのセッションは、警告を確認してから開いてください。</p>
-            </section>
-          )}
-          {desk.items.map((item) => (
-            <Article
-              key={item.id}
-              item={item}
-              collapsed={collapsed.includes(item.kind === "tool" ? item.toolId : "")}
-              onToggle={toggleTool}
-            />
-          ))}
-          {desk.loading && <p className="pending">会話を読み込んでいます…</p>}
-          {desk.busy && <p className="pending">応答しています…</p>}
-        </div>
 
-        {desk.permission && (
-          <PermissionCard
-            request={desk.permission}
-            plan={planEntries?.kind === "plan" ? planEntries.entries : []}
-            onDecide={(optionId) => {
-              const id = desk.permission?.id;
-              setDesk((current) => ({ ...current, permission: null }));
-              if (id === undefined) return;
-              void invoke("decide_permission", { id, optionId }).catch((error) =>
-                setDesk((current) => ({ ...current, error: String(error) })),
-              );
+          <div
+            className="transcript"
+            ref={transcriptRef}
+            onScroll={(event) => {
+              const box = event.currentTarget;
+              stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
             }}
-          />
-        )}
-
-        <form
-          className="composer"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void send();
-          }}
-        >
-          {files.length > 0 && (
-            <div className="chips">
-              {files.map((file) => (
-                <button key={file} type="button" onClick={() => setFiles((current) => current.filter((item) => item !== file))}>
-                  {file.split(/[\\/]/).pop()} ×
-                </button>
-              ))}
-            </div>
-          )}
-          {suggestions.length > 0 && (
-            <ul className="suggest">
-              {suggestions.map((path) => (
-                <li key={path}>
-                  <button type="button" onClick={() => attach(path)}>{path}</button>
-                </li>
-              ))}
-            </ul>
-          )}
-          <textarea
-            value={draft}
-            placeholder={desk.sessionId ? "メッセージ。Enter で送信、Shift+Enter で改行。@ でファイル" : "先に会話を開いてください"}
-            disabled={!desk.sessionId || desk.loading}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                if (suggestions.length > 0 && atQuery !== null) {
-                  attach(suggestions[0]);
-                  return;
-                }
-                void send();
-              }
-            }}
-          />
-          <div className="composer-actions">
-            <span>{draft.trim() ? `${draft.trim().length} 字` : "空送信はしません"}</span>
-            {desk.busy ? (
-              <button type="button" className="stop" onClick={() => void invoke("cancel_turn")}>停止</button>
-            ) : (
-              <button className="solid" type="submit" disabled={!desk.sessionId || !draft.trim()}>送る</button>
+          >
+            {!folder && (
+              <section className="empty">
+                <p className="eyebrow">作業フォルダ</p>
+                <h3>どのプロジェクトで会話するか選んでください。</h3>
+                <p>会話の正本は Grok のセッションに残ります。このアプリはそれを写し取りません。</p>
+                <button className="solid" type="button" onClick={() => void browseFolder()}>フォルダを選ぶ</button>
+              </section>
             )}
+            {folder && !desk.sessionId && !desk.loading && (
+              <section className="empty">
+                <h3>{folderName} で新しい会話を始められます。</h3>
+                <p>左の一覧から過去の会話を開くこともできます。開いているターミナルのセッションは、警告を確認してから開いてください。</p>
+              </section>
+            )}
+            {desk.items.map((item) => (
+              <Article
+                key={item.id}
+                item={item}
+                collapsed={collapsed.includes(item.kind === "tool" ? item.toolId : "")}
+                onToggle={toggleTool}
+              />
+            ))}
+            {desk.loading && <p className="pending">会話を読み込んでいます…</p>}
+            {desk.busy && <p className="pending">応答しています…</p>}
           </div>
-        </form>
+
+          {desk.permission && (
+            <PermissionCard
+              request={desk.permission}
+              plan={planEntries?.kind === "plan" ? planEntries.entries : []}
+              onDecide={(optionId) => {
+                const id = desk.permission?.id;
+                setDesk((current) => ({ ...current, permission: null }));
+                if (id === undefined) return;
+                void invoke("decide_permission", { id, optionId }).catch((error) =>
+                  setDesk((current) => ({ ...current, error: String(error) })),
+                );
+              }}
+            />
+          )}
+
+          <div className="composer-dock">
+            <form
+              className="composer"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void send();
+              }}
+            >
+              {files.length > 0 && (
+                <div className="chips">
+                  {files.map((file) => (
+                    <button key={file} type="button" onClick={() => setFiles((current) => current.filter((item) => item !== file))}>
+                      {file.split(/[\\/]/).pop()} ×
+                    </button>
+                  ))}
+                </div>
+              )}
+              {suggestions.length > 0 && (
+                <ul className="suggest">
+                  {suggestions.map((path) => (
+                    <li key={path}>
+                      <button type="button" onClick={() => attach(path)}>{path}</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <textarea
+                ref={inputRef}
+                value={draft}
+                placeholder={desk.sessionId ? "メッセージを入力" : "先に会話を開いてください"}
+                disabled={!desk.sessionId || desk.loading}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    if (suggestions.length > 0 && atQuery !== null) {
+                      attach(suggestions[0]);
+                      return;
+                    }
+                    void send();
+                  }
+                }}
+              />
+              <div className="composer-bar">
+                <button type="button" className="orb ghost" aria-label="ファイルを添付" disabled={!desk.sessionId || desk.loading} onClick={insertAt}>
+                  +
+                </button>
+                <span className="composer-hint">{draft.trim() ? `${draft.trim().length} 字` : "Enter で送信、Shift+Enter で改行"}</span>
+                {desk.busy ? (
+                  <button type="button" className="orb stop" aria-label="停止" onClick={() => void invoke("cancel_turn")}>
+                    <span className="stop-mark" />
+                  </button>
+                ) : (
+                  <button className="orb send" type="submit" aria-label="送信" disabled={!desk.sessionId || !draft.trim()}>
+                    <SendIcon />
+                  </button>
+                )}
+              </div>
+            </form>
+            <div className="composer-meta">
+              <label className="meta-select">
+                <span>{desk.modeConfirmed ? "権限" : "未確認"}</span>
+                <select
+                  value={desk.modeId}
+                  disabled={!desk.sessionId || desk.busy}
+                  onChange={(event) => {
+                    const modeId = event.target.value;
+                    void invoke("set_mode", { modeId }).catch((error) => setDesk((current) => ({ ...current, error: String(error) })));
+                  }}
+                >
+                  {modes.map((mode) => (
+                    <option key={mode.id} value={mode.id}>{mode.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="meta-configs">
+                {desk.configOptions.filter((option) => option.type === "select").map((option) => (
+                  <label key={option.id} className="meta-select">
+                    <span>{option.name}</span>
+                    <select
+                      value={option.currentValue}
+                      disabled={!desk.sessionId || desk.busy}
+                      onChange={(event) => void invoke("set_config", { id: option.id, value: event.target.value }).catch((error) => setDesk((current) => ({ ...current, error: String(error) })))}
+                    >
+                      {option.choices.map((choice) => (
+                        <option key={choice.value} value={choice.value}>{choice.name}</option>
+                      ))}
+                      {option.currentValue && !option.choices.some((choice) => choice.value === option.currentValue) && (
+                        <option value={option.currentValue}>{option.currentValue}</option>
+                      )}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
       </main>
 
       <aside className="context">
-        <p className="eyebrow">コンテキスト</p>
-        <h2>{gauge ? `空き ${gauge.percent}%` : "まだ測れていません"}</h2>
-        <div className="gauge" aria-hidden="true">
-          <span style={{ height: `${gauge ? 100 - gauge.percent : 0}%` }} />
-        </div>
-        {gauge ? (
-          <dl>
-            <div><dt>使用</dt><dd>{formatTokens(gauge.used)}</dd></div>
-            <div><dt>ウィンドウ</dt><dd>{formatTokens(gauge.size)}</dd></div>
-            <div><dt>空き</dt><dd>{formatTokens(gauge.free)}</dd></div>
-          </dl>
-        ) : (
-          <p className="note">ターンが終わると、入力トークンとモデルのウィンドウから空きを出します。</p>
-        )}
-        {desk.usage?.outputTokens !== undefined && (
-          <p className="note">出力 {formatTokens(desk.usage.outputTokens)}
-            {desk.usage.cachedReadTokens ? ` / キャッシュ読取 ${formatTokens(desk.usage.cachedReadTokens)}` : ""}
-            {desk.usage.reasoningTokens ? ` / 推論 ${formatTokens(desk.usage.reasoningTokens)}` : ""}
-          </p>
-        )}
-        <p className="note">巻き戻しは ACP では公開されていません。ここからファイルは戻りません。圧縮は Grok が内部で行うことがあり、結果が ACP に出ないときはその旨を表示します。</p>
-        <button
-          type="button"
-          disabled={!desk.sessionId || desk.busy}
-          onClick={() => void invoke("compact_session").catch((error) => setDesk((current) => ({ ...current, error: String(error) })))}
-        >
-          圧縮を頼む
-        </button>
+        <section className="side-card">
+          <div className="side-head">
+            <h2>コンテキスト</h2>
+            <strong>{gauge ? `${usedPercent}%` : "—"}</strong>
+          </div>
+          <div
+            className="meter"
+            role="meter"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={usedPercent}
+            aria-label={gauge ? `使用 ${usedPercent}%、空き ${gauge.percent}%` : "未計測"}
+          >
+            <span style={{ width: `${usedPercent}%` }} />
+          </div>
+          {gauge ? (
+            <dl>
+              <div><dt>空き</dt><dd>{gauge.percent}% · {formatTokens(gauge.free)}</dd></div>
+              <div><dt>使用</dt><dd>{formatTokens(gauge.used)}</dd></div>
+              <div><dt>ウィンドウ</dt><dd>{formatTokens(gauge.size)}</dd></div>
+            </dl>
+          ) : (
+            <p className="note">ターンが終わると、入力トークンとモデルのウィンドウから空きを出します。</p>
+          )}
+          {desk.usage?.outputTokens !== undefined && (
+            <p className="note">出力 {formatTokens(desk.usage.outputTokens)}
+              {desk.usage.cachedReadTokens ? ` / キャッシュ読取 ${formatTokens(desk.usage.cachedReadTokens)}` : ""}
+              {desk.usage.reasoningTokens ? ` / 推論 ${formatTokens(desk.usage.reasoningTokens)}` : ""}
+            </p>
+          )}
+        </section>
 
-        {desk.configOptions.filter((option) => option.type === "select").map((option) => (
-          <label key={option.id} className="config">
-            <span>{option.name}</span>
-            <select
-              value={option.currentValue}
-              disabled={!desk.sessionId || desk.busy}
-              onChange={(event) => void invoke("set_config", { id: option.id, value: event.target.value }).catch((error) => setDesk((current) => ({ ...current, error: String(error) })))}
-            >
-              {option.choices.map((choice) => (
-                <option key={choice.value} value={choice.value}>{choice.name}</option>
-              ))}
-              {option.currentValue && !option.choices.some((choice) => choice.value === option.currentValue) && (
-                <option value={option.currentValue}>{option.currentValue}</option>
-              )}
-            </select>
-          </label>
-        ))}
-        {desk.model && <p className="note">モデル状態: {desk.model}</p>}
+        <section className="side-card">
+          <div className="side-head">
+            <h2>セッション</h2>
+          </div>
+          <p className="note">巻き戻しは ACP では公開されていません。ここからファイルは戻りません。圧縮は Grok が内部で行うことがあり、結果が ACP に出ないときはその旨を表示します。</p>
+          <button
+            className="pill"
+            type="button"
+            disabled={!desk.sessionId || desk.busy}
+            onClick={() => void invoke("compact_session").catch((error) => setDesk((current) => ({ ...current, error: String(error) })))}
+          >
+            圧縮を頼む
+          </button>
+          {desk.model && <p className="note model-line">{desk.model}</p>}
+        </section>
+
         {desk.commands.length > 0 && (
-          <ul className="commands">
-            {desk.commands.slice(0, 12).map((command) => (
-              <li key={command.name}><code>/{command.name}</code> {command.description}</li>
-            ))}
-          </ul>
+          <section className="side-card">
+            <div className="side-head">
+              <h2>コマンド</h2>
+            </div>
+            <ul className="commands">
+              {desk.commands.slice(0, 12).map((command) => (
+                <li key={command.name}><code>/{command.name}</code> {command.description}</li>
+              ))}
+            </ul>
+          </section>
         )}
       </aside>
 
@@ -615,4 +680,12 @@ function MarkdownBody({ text }: { text: string }) {
 
 function formatTokens(value: number) {
   return new Intl.NumberFormat("ja-JP").format(value);
+}
+
+function SendIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 12.2V3.8M8 3.8 4.4 7.4M8 3.8l3.6 3.6" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
 }
