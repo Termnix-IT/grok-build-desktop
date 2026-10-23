@@ -29,6 +29,7 @@ use crate::usage::{
 };
 
 const MODE_WAIT: Duration = Duration::from_millis(800);
+const REPLAY_BATCH: usize = 48;
 
 pub struct AgentState {
     tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
@@ -181,6 +182,24 @@ struct Shared {
     mirror: Arc<Mutex<Mirror>>,
     images: Arc<ImageStore>,
     prompt_image: Arc<AtomicBool>,
+    replay_buf: Mutex<Vec<Value>>,
+}
+
+struct ReplayGuard<'a> {
+    shared: &'a Shared,
+}
+
+impl<'a> ReplayGuard<'a> {
+    fn arm(shared: &'a Shared) -> Self {
+        shared.replaying.store(true, Ordering::SeqCst);
+        Self { shared }
+    }
+}
+
+impl Drop for ReplayGuard<'_> {
+    fn drop(&mut self) {
+        finish_replay(self.shared);
+    }
 }
 
 enum End {
@@ -333,7 +352,14 @@ impl AgentState {
     }
 
     fn stage_one_path(&self, path: String) -> AttachmentRecord {
-        match load_path(Path::new(&path)) {
+        let file_path = Path::new(&path);
+        if image_mime_from_name(&path).is_some() && !self.prompt_image.load(Ordering::Relaxed) {
+            if file_path.is_file() {
+                return path_record(path);
+            }
+            return rejected(file_name_of(&path), "ファイルを読めません");
+        }
+        match load_path(file_path) {
             Ok(LoadedPath::Other { path }) => {
                 let name = file_name_of(&path);
                 AttachmentRecord {
@@ -347,12 +373,14 @@ impl AgentState {
                 }
             }
             Ok(LoadedPath::Image { name, mime, bytes }) => {
-                if !self.prompt_image.load(Ordering::Relaxed) {
-                    return rejected(name, "この Grok は画像入力を告知していません");
-                }
                 self.store_image(name, mime, bytes, Some(path))
             }
-            Err(message) => rejected(file_name_of(&path), message),
+            Err(message) => {
+                if image_mime_from_name(&path).is_some() && file_path.is_file() {
+                    return path_record(path);
+                }
+                rejected(file_name_of(&path), message)
+            }
         }
     }
 
@@ -444,6 +472,29 @@ pub fn owner_warning(session_id: &str, our_pid: Option<u32>) -> Option<String> {
     })
 }
 
+fn path_record(path: String) -> AttachmentRecord {
+    let raw = Path::new(&path);
+    let absolute = if raw.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(raw))
+            .unwrap_or_else(|_| raw.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let name = file_name_of(&absolute);
+    AttachmentRecord {
+        kind: "path".into(),
+        id: None,
+        path: Some(absolute),
+        name,
+        mime_type: None,
+        preview: None,
+        message: None,
+    }
+}
+
 fn rejected(name: String, message: impl Into<String>) -> AttachmentRecord {
     AttachmentRecord {
         kind: "rejected".into(),
@@ -497,6 +548,7 @@ fn agent_thread(
             mirror,
             images,
             prompt_image,
+            replay_buf: Mutex::new(Vec::new()),
         });
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -706,8 +758,8 @@ async fn dispatch(
                         response.config_options.as_ref(),
                         response.modes.as_ref(),
                     );
-                    let _ = publish_sessions(&shared, connection).await;
                     reply.send(Ok(()));
+                    publish_soon(&shared, connection).await;
                     Ok(())
                 }
                 Err(error) => fail_command(&shared, reply, error).await,
@@ -724,7 +776,7 @@ async fn dispatch(
             }
             let warning = owner_warning(&id, *lock(&shared.our_pid));
             close_open(connection, session_id).await;
-            shared.replaying.store(true, Ordering::SeqCst);
+            let replay = ReplayGuard::arm(&shared);
             emit(&shared, json!({ "type": "session-loading", "id": id }));
             let loaded = connection
                 .send_request(LoadSessionRequest::new(
@@ -733,7 +785,7 @@ async fn dispatch(
                 ))
                 .block_task()
                 .await;
-            shared.replaying.store(false, Ordering::SeqCst);
+            drop(replay);
             match loaded {
                 Ok(response) => {
                     *session_id = Some(id.clone());
@@ -746,8 +798,8 @@ async fn dispatch(
                         response.config_options.as_ref(),
                         response.modes.as_ref(),
                     );
-                    let _ = publish_sessions(&shared, connection).await;
                     reply.send(Ok(()));
+                    publish_soon(&shared, connection).await;
                     Ok(())
                 }
                 Err(error) => fail_command(&shared, reply, error).await,
@@ -874,6 +926,18 @@ async fn dispatch(
             }
             answer_publish(&shared, connection, reply).await
         }
+    }
+}
+
+async fn publish_soon(shared: &Arc<Shared>, connection: &ConnectionTo<Agent>) {
+    let background = shared.clone();
+    let list = connection.clone();
+    let spawned = connection.spawn(async move {
+        let _ = publish_sessions(&background, &list).await;
+        Ok(())
+    });
+    if spawned.is_err() {
+        let _ = publish_sessions(shared, connection).await;
     }
 }
 
@@ -1418,8 +1482,37 @@ fn publish(app: &AppHandle, value: Value) {
 }
 
 fn emit(shared: &Shared, value: Value) {
+    if shared.replaying.load(Ordering::SeqCst) {
+        let mut buf = lock(&shared.replay_buf);
+        if shared.replaying.load(Ordering::SeqCst) {
+            record(&shared.mirror, &value);
+            buf.push(value);
+            if buf.len() >= REPLAY_BATCH {
+                let batch = std::mem::take(&mut *buf);
+                publish_replay(shared, batch);
+            }
+            return;
+        }
+    }
     record(&shared.mirror, &value);
     publish(&shared.app, value);
+}
+
+fn publish_replay(shared: &Shared, batch: Vec<Value>) {
+    if batch.is_empty() {
+        return;
+    }
+    publish(
+        &shared.app,
+        json!({ "type": "replay", "events": batch }),
+    );
+}
+
+fn finish_replay(shared: &Shared) {
+    let mut buf = lock(&shared.replay_buf);
+    shared.replaying.store(false, Ordering::SeqCst);
+    let batch = std::mem::take(&mut *buf);
+    publish_replay(shared, batch);
 }
 
 fn emit_error(shared: &Shared, message: &str) {

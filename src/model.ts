@@ -233,6 +233,17 @@ export function reduceDesk(state: DeskState, event: Record<string, unknown>): De
       };
     case "sessions":
       return { ...state, sessions: parseSessions(event.sessions) };
+    case "replay": {
+      const events = Array.isArray(event.events) ? event.events : [];
+      let next = state;
+      for (const item of events) {
+        if (!item || typeof item !== "object") continue;
+        const row = item as Record<string, unknown>;
+        if (row.type === "replay") continue;
+        next = reduceDesk(next, row);
+      }
+      return next;
+    }
     case "chunk":
       return appendChunk(state, event);
     case "tool":

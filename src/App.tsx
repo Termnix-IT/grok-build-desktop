@@ -1,8 +1,9 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import Markdown from "react-markdown";
@@ -28,7 +29,17 @@ import "./App.css";
 
 const RECENT_KEY = "gbd-recent-folders";
 const LAST_KEY = "gbd-last-folder";
-const COLLAPSED_KEY = "gbd-collapsed-tools";
+const OPEN_KEY = "gbd-open-tools";
+const VIEW_KEY = "gbd-transcript-view";
+const CONTEXT_KEY = "gbd-context-open";
+
+type TranscriptView = "chat" | "thought" | "all";
+
+const TRANSCRIPT_VIEWS: { id: TranscriptView; label: string }[] = [
+  { id: "chat", label: "会話と結果" },
+  { id: "thought", label: "思考" },
+  { id: "all", label: "すべて" },
+];
 
 type LocalImage = { id: string; name: string; preview: string };
 type StageRecord = {
@@ -102,6 +113,34 @@ function formatUpdateError(error: unknown) {
   return message;
 }
 
+function windowAct(action: "minimize" | "toggleMaximize" | "close") {
+  const win = getCurrentWindow();
+  const task =
+    action === "minimize" ? win.minimize() : action === "close" ? win.close() : win.toggleMaximize();
+  void task.catch(() => {});
+}
+
+function readView(): TranscriptView {
+  const raw = localStorage.getItem(VIEW_KEY);
+  if (raw === "chat" || raw === "thought" || raw === "all") return raw;
+  return "all";
+}
+
+function showsTranscriptItem(item: TranscriptItem, view: TranscriptView) {
+  if (view === "all") return true;
+  if (item.kind === "text" && item.role === "thought") return view === "thought";
+  if (item.kind === "tool" || item.kind === "plan") return view === "chat";
+  return true;
+}
+
+function baseName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function showsMarkdown(text: string) {
+  return /```|\*\*|__|`[^`\n]+`|^\s{0,3}#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|\[[^\]]+\]\([^)]+\)/m.test(text);
+}
+
 function readList(key: string) {
   try {
     const raw = JSON.parse(localStorage.getItem(key) ?? "[]");
@@ -126,11 +165,14 @@ export default function App() {
   const [files, setFiles] = useState<string[]>([]);
   const [images, setImages] = useState<LocalImage[]>([]);
   const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [collapsed, setCollapsed] = useState<string[]>(() => readList(COLLAPSED_KEY));
+  const [openTools, setOpenTools] = useState<string[]>(() => readList(OPEN_KEY));
+  const [sessionFilter, setSessionFilter] = useState("");
   const [pendingLoad, setPendingLoad] = useState<{ id: string; warning: string } | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsPos, setSettingsPos] = useState<{ left: number; bottom: number } | null>(null);
+  const [transcriptView, setTranscriptView] = useState<TranscriptView>(readView);
+  const [contextOpen, setContextOpen] = useState(() => localStorage.getItem(CONTEXT_KEY) !== "0");
+  const [treeOpen, setTreeOpen] = useState(true);
   const [accountUsage, setAccountUsage] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [appVersion, setAppVersion] = useState("");
@@ -142,8 +184,6 @@ export default function App() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
   const sheetRef = useRef<HTMLDivElement>(null);
-  const settingsButtonRef = useRef<HTMLButtonElement>(null);
-  const settingsPopRef = useRef<HTMLDivElement>(null);
   const usageWatch = useRef(false);
   const usageBuf = useRef("");
   const pathDropAt = useRef(0);
@@ -153,6 +193,14 @@ export default function App() {
   const takeFilesRef = useRef<(dropped: File[]) => void>(() => {});
 
   useEffect(() => {
+    let frame = 0;
+    const queue: Record<string, unknown>[] = [];
+    const flush = () => {
+      frame = 0;
+      const batch = queue.splice(0);
+      if (batch.length === 0) return;
+      setDesk((current) => batch.reduce((state, payload) => reduceDesk(state, payload), current));
+    };
     const unlisten = listen<Record<string, unknown>>("agent-event", (event) => {
       const payload = event.payload;
       if (usageWatch.current) {
@@ -170,9 +218,11 @@ export default function App() {
           }
         }
       }
-      setDesk((current) => reduceDesk(current, payload));
+      queue.push(payload);
+      if (!frame) frame = window.requestAnimationFrame(flush);
     });
     return () => {
+      if (frame) window.cancelAnimationFrame(frame);
       void unlisten.then((stop) => stop());
     };
   }, []);
@@ -205,22 +255,16 @@ export default function App() {
 
   useEffect(() => {
     if (!settingsOpen) return;
-    function onPointer(event: MouseEvent) {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (settingsPopRef.current?.contains(target) || settingsButtonRef.current?.contains(target)) return;
-      setSettingsOpen(false);
-    }
     function onKey(event: KeyboardEvent) {
       if (event.key === "Escape") setSettingsOpen(false);
     }
-    window.addEventListener("mousedown", onPointer);
     window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onPointer);
-      window.removeEventListener("keydown", onKey);
-    };
+    return () => window.removeEventListener("keydown", onKey);
   }, [settingsOpen]);
+
+  useEffect(() => {
+    if (folder) setTreeOpen(true);
+  }, [folder]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -319,12 +363,34 @@ export default function App() {
     if (typeof picked === "string") await chooseFolder(picked);
   }
 
+  function insertDraftPaths(paths: string[]) {
+    if (paths.length === 0) return;
+    const block = paths.join("\n");
+    const field = inputRef.current;
+    setDraft((current) => {
+      const start = field?.selectionStart ?? current.length;
+      const end = field?.selectionEnd ?? start;
+      const next = `${current.slice(0, start)}${block}${current.slice(end)}`;
+      const caret = start + block.length;
+      window.requestAnimationFrame(() => {
+        const node = inputRef.current;
+        if (!node || node.disabled) return;
+        node.focus();
+        node.setSelectionRange(caret, caret);
+      });
+      return next;
+    });
+  }
+
   function absorb(records: StageRecord[]) {
     const rejected: string[] = [];
     const nextFiles: string[] = [];
     const nextImages: LocalImage[] = [];
+    const pathInserts: string[] = [];
     for (const record of records) {
-      if (record.kind === "image" && record.id && record.preview) {
+      if (record.kind === "path" && record.path) {
+        pathInserts.push(record.path);
+      } else if (record.kind === "image" && record.id && record.preview) {
         nextImages.push({ id: record.id, name: record.name, preview: record.preview });
       } else if (record.kind === "file" && record.path) {
         nextFiles.push(record.path);
@@ -332,6 +398,7 @@ export default function App() {
         rejected.push(record.message || `${record.name} は添付できません`);
       }
     }
+    if (pathInserts.length) insertDraftPaths(pathInserts);
     if (nextFiles.length) {
       setFiles((current) => {
         const merged = [...current];
@@ -493,14 +560,14 @@ export default function App() {
     inputRef.current?.focus();
   }
 
-  function toggleSettings() {
-    if (settingsOpen) {
-      setSettingsOpen(false);
-      return;
-    }
-    const rect = settingsButtonRef.current?.getBoundingClientRect();
-    if (rect) setSettingsPos({ left: rect.left, bottom: window.innerHeight - rect.top + 8 });
-    setSettingsOpen(true);
+  function chooseView(view: TranscriptView) {
+    setTranscriptView(view);
+    localStorage.setItem(VIEW_KEY, view);
+  }
+
+  function setContext(open: boolean) {
+    setContextOpen(open);
+    localStorage.setItem(CONTEXT_KEY, open ? "1" : "0");
   }
 
   async function checkUpdate() {
@@ -552,11 +619,39 @@ export default function App() {
   async function load(id: string) {
     setPendingLoad(null);
     stickRef.current = true;
+    setDesk((current) => ({
+      ...current,
+      loading: true,
+      items: [],
+      permission: null,
+      warning: "",
+      banner: "",
+      error: "",
+      ignoreSessionId: current.sessionId,
+      sessionId: id,
+    }));
     try {
       await invoke("load_session", { id });
     } catch (error) {
       setDesk((current) => ({ ...current, error: String(error), loading: false }));
     }
+  }
+
+  function startSession() {
+    setDesk((current) => ({
+      ...current,
+      loading: true,
+      items: [],
+      permission: null,
+      warning: "",
+      banner: "",
+      error: "",
+      ignoreSessionId: current.sessionId,
+      sessionId: null,
+    }));
+    void invoke("new_session").catch((error) =>
+      setDesk((current) => ({ ...current, error: String(error), loading: false })),
+    );
   }
 
   function attach(path: string) {
@@ -575,85 +670,144 @@ export default function App() {
     inputRef.current?.focus();
   }
 
-  function toggleTool(id: string) {
-    setCollapsed((current) => {
+  const toggleTool = useCallback((id: string) => {
+    setOpenTools((current) => {
       const next = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
-      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next));
+      localStorage.setItem(OPEN_KEY, JSON.stringify(next));
       return next;
     });
-  }
+  }, []);
 
-  const folderName = folder ? folder.split(/[\\/]/).filter(Boolean).pop() : "";
+  const visibleSessions = useMemo(() => {
+    const needle = sessionFilter.trim().toLowerCase();
+    if (!needle) return desk.sessions;
+    return desk.sessions.filter((session) => (session.title || "無題").toLowerCase().includes(needle));
+  }, [desk.sessions, sessionFilter]);
+  const folders = useMemo(() => {
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const path of folder ? [folder, ...recent] : recent) {
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      list.push(path);
+    }
+    return list;
+  }, [folder, recent]);
+  const sessionNeedle = sessionFilter.trim().toLowerCase();
+  const shownItems = useMemo(
+    () => desk.items.filter((item) => showsTranscriptItem(item, transcriptView)),
+    [desk.items, transcriptView],
+  );
+  const openTitle =
+    desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title ||
+    (desk.sessionId ? "無題" : "");
 
   return (
-    <div className="desk">
+    <div className={contextOpen ? "desk" : "desk context-shut"}>
       <aside className="rail">
-        <div className="mark">
-          <span className="logo-mark" aria-hidden="true">G</span>
-          <div>
-            <p className="product">Grok Build</p>
-            <p className="status">
-              <i className={desk.ready ? "dot on" : "dot"} />
-              {desk.ready ? "接続済み" : "起動しています"}
-            </p>
-          </div>
-        </div>
-        <button className="folder-pick" type="button" onClick={() => void browseFolder()}>
-          <span>フォルダを選ぶ</span>
-          <small>{folderName || "プロジェクトを開く"}</small>
+        <label className="finder">
+          <SearchIcon />
+          <input
+            value={sessionFilter}
+            placeholder="検索"
+            aria-label="検索"
+            onChange={(event) => setSessionFilter(event.target.value)}
+          />
+        </label>
+        <button className="new-chat" type="button" disabled={!folder || desk.busy} onClick={startSession}>
+          <span aria-hidden="true">+</span>
+          新規
         </button>
-        <div className="recent">
-          {recent.map((path) => (
-            <button key={path} type="button" className={path === folder ? "recent on" : "recent"} onClick={() => void chooseFolder(path)}>
-              {path.split(/[\\/]/).filter(Boolean).pop()}
-            </button>
-          ))}
+        <div className="folder-line">
+          <i />
+          <button type="button" aria-label="フォルダを追加" onClick={() => void browseFolder()}>+</button>
         </div>
-        <div className="session-head">
-          <span>このフォルダ</span>
-          <button type="button" disabled={!folder || desk.busy} onClick={() => void invoke("new_session").catch((error) => setDesk((current) => ({ ...current, error: String(error) })))}>
-            新しい会話
-          </button>
+        <div className="folder-scroll">
+          {folders.map((path) => {
+            const selected = path === folder;
+            const name = baseName(path).toLowerCase();
+            if (sessionNeedle && !name.includes(sessionNeedle) && !(selected && visibleSessions.length > 0)) return null;
+            const open = selected && (treeOpen || sessionNeedle.length > 0);
+            return (
+              <div key={path} className="folder-block">
+                <button
+                  type="button"
+                  className={selected ? "folder-node on" : "folder-node"}
+                  title={path}
+                  onClick={() => {
+                    if (selected) {
+                      setTreeOpen((current) => !current);
+                      return;
+                    }
+                    setTreeOpen(true);
+                    void chooseFolder(path);
+                  }}
+                >
+                  <span className="twist" aria-hidden="true">{selected ? (open ? "▾" : "▸") : ""}</span>
+                  {baseName(path)}
+                </button>
+                {open && (
+                  <ul className="tree">
+                    {visibleSessions.map((session) => {
+                      const on = session.sessionId === desk.sessionId;
+                      return (
+                        <li key={session.sessionId} className={on ? "tree-row on" : "tree-row"}>
+                          <button
+                            type="button"
+                            className="session"
+                            title={session.title || session.sessionId}
+                            onClick={() => void openSession(session.sessionId)}
+                          >
+                            <strong>{session.title || "無題"}</strong>
+                          </button>
+                          <button type="button" className="icon" aria-label="削除" onClick={() => setPendingDelete(session.sessionId)}>
+                            ×
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
         </div>
-        <ul className="sessions">
-          {desk.sessions.map((session) => (
-            <li key={session.sessionId} className={session.sessionId === desk.sessionId ? "session-row on" : "session-row"}>
-              <button
-                type="button"
-                className="session"
-                onClick={() => void openSession(session.sessionId)}
-              >
-                <strong>{session.title || "無題"}</strong>
-                <small>{session.updatedAt ? session.updatedAt.slice(0, 16).replace("T", " ") : session.sessionId.slice(0, 8)}</small>
-              </button>
-              <button type="button" className="icon" aria-label="削除" onClick={() => setPendingDelete(session.sessionId)}>
-                ×
-              </button>
-            </li>
-          ))}
-        </ul>
-        {desk.sessionId && (
-          <button type="button" className="quiet" disabled={desk.busy} onClick={() => void invoke("close_session")}>
-            この会話を閉じる
-          </button>
-        )}
         <div className="rail-foot">
-          <button ref={settingsButtonRef} type="button" className="settings-open" aria-expanded={settingsOpen} onClick={toggleSettings}>
+          <button type="button" className="settings-open" aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}>
             <GearIcon />
             設定
+            {!desk.ready && <i className="dot" />}
           </button>
         </div>
       </aside>
 
-      <main className="stage">
-        <header className="stage-bar">
-          <h2>{desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title || (desk.sessionId ? "無題の会話" : "会話はまだ開いていません")}</h2>
-          <p className="conn">
-            <i className={desk.ready ? "dot on" : "dot"} />
-            {desk.ready ? desk.agentVersion || "接続済み" : "起動しています"}
-          </p>
-        </header>
+      <header className="chrome">
+        <div className="chrome-drag" data-tauri-drag-region onDoubleClick={() => windowAct("toggleMaximize")}>
+          <h2>{openTitle}</h2>
+        </div>
+        {desk.sessionId && (
+          <button
+            type="button"
+            className="quiet chrome-close"
+            disabled={desk.busy}
+            onClick={() => void invoke("close_session")}
+          >
+            閉じる
+          </button>
+        )}
+        {!contextOpen && (
+          <button type="button" className="pane-toggle" aria-label="コンテキストを開く" onClick={() => setContext(true)}>
+            <PaneGlyph />
+          </button>
+        )}
+        <div className="window-controls">
+          <button type="button" aria-label="最小化" onClick={() => windowAct("minimize")}><CaptionGlyph kind="min" /></button>
+          <button type="button" aria-label="最大化" onClick={() => windowAct("toggleMaximize")}><CaptionGlyph kind="max" /></button>
+          <button type="button" className="close" aria-label="閉じる" onClick={() => windowAct("close")}><CaptionGlyph kind="close" /></button>
+        </div>
+      </header>
 
+      <main className="stage">
         <div
           className="sheet"
           ref={sheetRef}
@@ -677,7 +831,7 @@ export default function App() {
             }, 300);
           }}
         >
-          {desk.warning && <p className="banner warn">{desk.warning} ファイルの巻き戻しはしません。</p>}
+          {desk.warning && <p className="banner warn">{desk.warning}</p>}
           {desk.banner && <p className="banner">{desk.banner}</p>}
           {desk.error && (
             <p className="banner warn">
@@ -696,30 +850,16 @@ export default function App() {
               stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
             }}
           >
-            {!folder && (
-              <section className="empty">
-                <p className="eyebrow">作業フォルダ</p>
-                <h3>どのプロジェクトで会話するか選んでください。</h3>
-                <p>会話の正本は Grok のセッションに残ります。このアプリはそれを写し取りません。</p>
-                <button className="solid" type="button" onClick={() => void browseFolder()}>フォルダを選ぶ</button>
-              </section>
-            )}
-            {folder && !desk.sessionId && !desk.loading && (
-              <section className="empty">
-                <h3>{folderName} で新しい会話を始められます。</h3>
-                <p>左の一覧から過去の会話を開くこともできます。開いているターミナルのセッションは、警告を確認してから開いてください。</p>
-              </section>
-            )}
-            {desk.items.map((item) => (
+            {shownItems.map((item) => (
               <Article
                 key={item.id}
                 item={item}
-                collapsed={collapsed.includes(item.kind === "tool" ? item.toolId : "")}
+                collapsed={item.kind !== "tool" || !openTools.includes(item.toolId)}
                 onToggle={toggleTool}
               />
             ))}
-            {desk.loading && <p className="pending">会話を読み込んでいます…</p>}
-            {desk.busy && <p className="pending">応答しています…</p>}
+            {desk.loading && desk.items.length === 0 && <p className="pending">読み込み中</p>}
+            {desk.busy && <p className="pending" aria-label="応答しています">…</p>}
           </div>
 
           {desk.permission && (
@@ -769,10 +909,15 @@ export default function App() {
                   ))}
                 </ul>
               )}
+              {showsMarkdown(draft) && (
+                <div className="composer-preview bubble assistant">
+                  <MarkdownBody text={draft} live />
+                </div>
+              )}
               <textarea
                 ref={inputRef}
                 value={draft}
-                placeholder={desk.sessionId ? "メッセージを入力" : "先に会話を開いてください"}
+                placeholder="メッセージ"
                 disabled={!desk.sessionId || desk.loading}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
@@ -790,7 +935,7 @@ export default function App() {
                 <button type="button" className="orb ghost" aria-label="ファイルを添付" disabled={!desk.sessionId || desk.loading} onClick={insertAt}>
                   +
                 </button>
-                <span className="composer-hint">{draft.trim() ? `${draft.trim().length} 字` : "Enter で送信、Shift+Enter で改行"}</span>
+                <span className="composer-spacer" />
                 {desk.busy ? (
                   <button type="button" className="orb stop" aria-label="停止" onClick={() => void invoke("cancel_turn")}>
                     <span className="stop-mark" />
@@ -852,11 +997,15 @@ export default function App() {
         </div>
       </main>
 
+      {contextOpen && (
       <aside className="context">
         <section className="side-card">
           <div className="side-head">
             <h2>コンテキスト</h2>
             <strong>{gauge ? `${usedPercent}%` : "—"}</strong>
+            <button type="button" className="context-collapse" aria-label="コンテキストを畳む" onClick={() => setContext(false)}>
+              <PaneGlyph />
+            </button>
           </div>
           <div
             className="meter"
@@ -874,57 +1023,70 @@ export default function App() {
               <div><dt>使用</dt><dd>{formatTokens(gauge.used)}</dd></div>
               <div><dt>ウィンドウ</dt><dd>{formatTokens(gauge.size)}</dd></div>
             </dl>
-          ) : (
-            <p className="note">ターンが終わると、入力トークンとモデルのウィンドウから空きを出します。</p>
-          )}
+          ) : null}
           {desk.usage?.outputTokens !== undefined && (
             <p className="note">出力 {formatTokens(desk.usage.outputTokens)}
-              {desk.usage.cachedReadTokens ? ` / キャッシュ読取 ${formatTokens(desk.usage.cachedReadTokens)}` : ""}
-              {desk.usage.reasoningTokens ? ` / 推論 ${formatTokens(desk.usage.reasoningTokens)}` : ""}
+              {desk.usage.cachedReadTokens ? ` · キャッシュ ${formatTokens(desk.usage.cachedReadTokens)}` : ""}
+              {desk.usage.reasoningTokens ? ` · 推論 ${formatTokens(desk.usage.reasoningTokens)}` : ""}
             </p>
           )}
-        </section>
-
-        <section className="side-card">
-          <div className="side-head">
-            <h2>セッション</h2>
-          </div>
-          <p className="note">巻き戻しは ACP では公開されていません。ここからファイルは戻りません。圧縮は Grok が内部で行うことがあり、結果が ACP に出ないときはその旨を表示します。</p>
           <button
             className="pill"
             type="button"
             disabled={!desk.sessionId || desk.busy}
             onClick={() => void invoke("compact_session").catch((error) => setDesk((current) => ({ ...current, error: String(error) })))}
           >
-            圧縮を頼む
+            圧縮
           </button>
-          {desk.model && <p className="note model-line">{desk.model}</p>}
         </section>
       </aside>
+      )}
 
-      {settingsOpen && settingsPos && (
-        <div
-          className="settings-pop"
-          ref={settingsPopRef}
-          style={{ left: settingsPos.left, bottom: settingsPos.bottom }}
+      {settingsOpen && (
+        <div className="modal" onMouseDown={() => setSettingsOpen(false)}>
+        <section
+          className="settings-window"
           role="dialog"
           aria-label="設定"
+          onMouseDown={(event) => event.stopPropagation()}
         >
+          <header className="settings-bar">
+            <h2>設定</h2>
+            <button type="button" aria-label="閉じる" onClick={() => setSettingsOpen(false)}>×</button>
+          </header>
+          <div className="settings-frame">
+            <h3>セッション会話表示調整</h3>
+            <div className="view-switch" role="radiogroup" aria-label="セッション会話表示調整">
+              {TRANSCRIPT_VIEWS.map((view) => {
+                const selected = transcriptView === view.id;
+                return (
+                  <button
+                    key={view.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    className="view-option"
+                    onClick={() => chooseView(view.id)}
+                  >
+                    <span className="quiet-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+                    {view.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
           <h3>Grok の使用量</h3>
           <button type="button" className="pill" disabled={!desk.sessionId || desk.busy || desk.loading} onClick={askUsage}>
             使用量を確認
           </button>
           {accountUsage && <p className="settings-copy">{accountUsage}</p>}
-          <h3>コマンド</h3>
-          {desk.commands.length === 0 ? (
-            <p className="note">接続すると、使えるコマンドがここに出ます。</p>
-          ) : (
+          {desk.commands.length > 0 && <h3>コマンド</h3>}
+          {desk.commands.length > 0 && (
             <ul className="settings-commands">
               {desk.commands.map((command) => (
                 <li key={command.name}>
-                  <button type="button" onClick={() => insertCommand(command.name)}>
+                  <button type="button" title={command.description || undefined} onClick={() => insertCommand(command.name)}>
                     <code>/{command.name}</code>
-                    {command.description && <small>{command.description}</small>}
                   </button>
                 </li>
               ))}
@@ -944,6 +1106,7 @@ export default function App() {
               最新の版を適用
             </button>
           )}
+        </section>
         </div>
       )}
 
@@ -952,7 +1115,7 @@ export default function App() {
           <section>
             <h3>別のプロセスが開いている可能性があります</h3>
             <p>{pendingLoad.warning}</p>
-            <div>
+            <div className="modal-actions">
               <button type="button" onClick={() => setPendingLoad(null)}>やめる</button>
               <button className="solid" type="button" onClick={() => void load(pendingLoad.id)}>それでも開く</button>
             </div>
@@ -964,7 +1127,7 @@ export default function App() {
           <section>
             <h3>この会話を削除しますか</h3>
             <p>Grok のセッション履歴から消します。このアプリは写しを持っていません。</p>
-            <div>
+            <div className="modal-actions">
               <button type="button" onClick={() => setPendingDelete(null)}>やめる</button>
               <button
                 className="solid danger"
@@ -986,7 +1149,7 @@ export default function App() {
           <section>
             <h3>最新の版をインストールしますか</h3>
             <p>最新の版をインストールすると、このアプリは終了します。会話は Grok のセッションに残ります。</p>
-            <div>
+            <div className="modal-actions">
               <button type="button" onClick={() => setPendingApply(false)}>やめる</button>
               <button className="solid" type="button" onClick={() => void confirmApply()}>インストールする</button>
             </div>
@@ -997,7 +1160,7 @@ export default function App() {
   );
 }
 
-function Article({ item, collapsed, onToggle }: { item: TranscriptItem; collapsed: boolean; onToggle: (id: string) => void }) {
+const Article = memo(function Article({ item, collapsed, onToggle }: { item: TranscriptItem; collapsed: boolean; onToggle: (id: string) => void }) {
   if (item.kind === "text" && item.role === "user") {
     return (
       <article className="bubble user">
@@ -1053,7 +1216,7 @@ function Article({ item, collapsed, onToggle }: { item: TranscriptItem; collapse
       <pre>{item.text}</pre>
     </details>
   );
-}
+});
 
 function ToolCard({ tool, collapsed, onToggle }: { tool: ToolPayload; collapsed: boolean; onToggle: () => void }) {
   const content = Array.isArray(tool.content) ? tool.content : [];
@@ -1142,9 +1305,38 @@ function PermissionCard({
   );
 }
 
-function MarkdownBody({ text }: { text: string }) {
-  return <Markdown remarkPlugins={[remarkGfm, remarkBreaks]}>{text}</Markdown>;
-}
+const MarkdownBody = memo(function MarkdownBody({ text, live = false }: { text: string; live?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [ready, setReady] = useState(live);
+  useEffect(() => {
+    if (live) return;
+    const node = ref.current;
+    if (!node || typeof IntersectionObserver === "undefined") {
+      setReady(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setReady(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "700px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [live]);
+  return (
+    <div ref={ref} className="md">
+      {ready ? (
+        <Markdown remarkPlugins={[remarkGfm, remarkBreaks]}>{text}</Markdown>
+      ) : (
+        <p className="md-plain">{text}</p>
+      )}
+    </div>
+  );
+});
 
 function QuietSelect({
   label,
@@ -1255,6 +1447,36 @@ function ContextRing({
       </svg>
       <span>{gauge ? usedPercent : "—"}</span>
     </span>
+  );
+}
+
+function CaptionGlyph({ kind }: { kind: "min" | "max" | "close" }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      {kind === "min" && <path d="M3.5 8h9" fill="none" stroke="currentColor" strokeWidth="1.15" />}
+      {kind === "max" && <rect x="3.5" y="3.5" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1.15" />}
+      {kind === "close" && (
+        <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8" fill="none" stroke="currentColor" strokeWidth="1.15" />
+      )}
+    </svg>
+  );
+}
+
+function PaneGlyph() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="2.5" y="3" width="11" height="10" fill="none" stroke="currentColor" strokeWidth="1.15" />
+      <path d="M10 3.2v9.6" fill="none" stroke="currentColor" strokeWidth="1.15" />
+    </svg>
+  );
+}
+
+function SearchIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M10.4 10.4 13 13" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
   );
 }
 
