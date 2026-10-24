@@ -87,14 +87,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.quiet.chrome-close {
-  width: auto;
-  margin: 0 10px 0 0;
-  flex: none;
-  padding: 4px 8px;
-}
 .pane-toggle,
-.context-collapse,
 .window-controls button {
   margin: 0;
   padding: 0;
@@ -111,19 +104,11 @@ button:focus-visible, select:focus-visible, textarea:focus-visible {
   height: 40px;
   flex: none;
 }
-.context-collapse {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  color: var(--muted);
-}
 .window-controls { display: flex; flex: none; align-items: stretch; }
 .window-controls svg,
-.pane-toggle svg,
-.context-collapse svg { display: block; }
+.pane-toggle svg { display: block; }
 .window-controls button:hover,
-.pane-toggle:hover,
-.context-collapse:hover { background: rgba(255, 255, 255, 0.08); }
+.pane-toggle:hover { background: rgba(255, 255, 255, 0.08); }
 .window-controls button.close:hover { background: #c42b1c; color: #fff; }
 
 .dot {
@@ -462,6 +447,11 @@ button:disabled:hover { background: transparent; }
   resize: none; border: 0; background: transparent;
   padding: 8px 8px 4px; line-height: 1.5; font-size: 14.5px;
 }
+.composer textarea:focus,
+.composer textarea:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
 .composer textarea::placeholder { color: var(--faint); }
 .composer-bar {
   display: flex; align-items: center; gap: 8px; padding: 2px 2px 2px 0;
@@ -579,6 +569,16 @@ button:disabled:hover { background: transparent; }
 .side-card:last-child { border-bottom: 0; }
 .side-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .side-head strong { margin-left: auto; }
+.context-close {
+  width: auto;
+  margin: 0;
+  flex: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.context-close:hover { background: #262626; color: var(--text); }
 .side-head h2 { margin: 0; font-size: 13px; font-weight: 620; }
 .side-head strong { color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; }
 .meter {

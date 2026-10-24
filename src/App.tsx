@@ -785,21 +785,15 @@ export default function App() {
         <div className="chrome-drag" data-tauri-drag-region onDoubleClick={() => windowAct("toggleMaximize")}>
           <h2>{openTitle}</h2>
         </div>
-        {desk.sessionId && (
-          <button
-            type="button"
-            className="quiet chrome-close"
-            disabled={desk.busy}
-            onClick={() => void invoke("close_session")}
-          >
-            閉じる
-          </button>
-        )}
-        {!contextOpen && (
-          <button type="button" className="pane-toggle" aria-label="コンテキストを開く" onClick={() => setContext(true)}>
-            <PaneGlyph />
-          </button>
-        )}
+        <button
+          type="button"
+          className="pane-toggle"
+          aria-expanded={contextOpen}
+          aria-label={contextOpen ? "コンテキストを畳む" : "コンテキストを開く"}
+          onClick={() => setContext(!contextOpen)}
+        >
+          <PaneGlyph />
+        </button>
         <div className="window-controls">
           <button type="button" aria-label="最小化" onClick={() => windowAct("minimize")}><CaptionGlyph kind="min" /></button>
           <button type="button" aria-label="最大化" onClick={() => windowAct("toggleMaximize")}><CaptionGlyph kind="max" /></button>
@@ -1003,9 +997,16 @@ export default function App() {
           <div className="side-head">
             <h2>コンテキスト</h2>
             <strong>{gauge ? `${usedPercent}%` : "—"}</strong>
-            <button type="button" className="context-collapse" aria-label="コンテキストを畳む" onClick={() => setContext(false)}>
-              <PaneGlyph />
-            </button>
+            {desk.sessionId && (
+              <button
+                type="button"
+                className="context-close"
+                disabled={desk.busy}
+                onClick={() => void invoke("close_session")}
+              >
+                閉じる
+              </button>
+            )}
           </div>
           <div
             className="meter"
