@@ -1,0 +1,12 @@
+Generator: built-in image_gen (transparent_background=true).
+Source: source-icon.png (original generated RGBA PNG).
+Derived assets: Tauri CLI icon command; favicon.png uses 32x32.png.
+
+Use case: logo-brand.
+Asset type: production Windows desktop app icon for a third-party Grok Build CLI desktop client.
+Primary request: a striking, extremely simple black and white angular X monogram, with a small electric-blue terminal underscore cursor at lower right. Evoke Grok's austere monochrome technology aesthetic while creating an original distinct symbol, not a reproduction of the X social-network or xAI logos.
+Composition: square 1024x1024 canvas, one near-black rounded-square tile occupying 92% of the canvas, centered, genuinely transparent outside the rounded tile. Flat tile with radius about 18% of tile width. Center a very large bold geometric white X in the upper-middle of the tile, overall monogram occupies about 60% of canvas width and 58% of canvas height. The X is formed by two clean solid intersecting diagonal ribbons with a strong ascending forward slash and slightly shorter descending arm, balanced and precise. White X must remain instantly legible at 16 and 32 pixels. Below the X, aligned with its right edge, place one short thick horizontal electric-blue underscore cursor, about 14% of canvas width and 4% of canvas height, with clear black separation from the X.
+Palette: tile #101113, symbol #F5F5F5, cursor #4A96FF. Confident polished desktop software identity.
+Style: flat vector-like raster logo, perfectly crisp edges, solid filled shapes, generous padding.
+Avoid: any text or wordmark, letters other than the symbolic X, badges, secondary frames, windows, chat bubbles, tools, gears, orbit rings, gradients, glow, shadows, bevels, texture, 3D, mockup scenes, watermarks, multiple icons, tiny details.
+Output a single finished icon only, with actual transparent alpha outside the tile.
