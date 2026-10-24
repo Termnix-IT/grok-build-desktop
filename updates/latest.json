@@ -1,11 +1,11 @@
 {
-  "version": "0.0.2",
-  "notes": "開発β v0.0.2 です。設定、会話の Markdown、コンテキストの使用割合、画像のドロップを追加しました。",
-  "pub_date": "2026-10-19T20:14:54Z",
+  "version": "0.0.3",
+  "notes": "開発β v0.0.3 です。枠なしの画面、会話の表示切替、フォルダのツリー、コンテキストの折りたたみ、アプリのアイコンを追加しました。",
+  "pub_date": "2026-10-24T01:20:16Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRY05zVnRVSENoNk1EY05SQWowR3pENDRSaDgyVE8yV1A5SUZBT1BWQnE2ek1mZG9VTU5uQWRQdmtIWkxCL1V4UzFBaU9SMmdSano5YjBXTnhGUmhmY0dOeGJ4b1JIK1FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDQwNzgxCWZpbGU6R3JvayBCdWlsZCBEZXNrdG9wXzAuMC4yX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjAuMgp1MkdUNjdaeUZUckNlbGltUlNUUmMxYUhzWFNEN3JvQlluTVB3UzJEYTFGcVl2cG9yZ1dnWGh3WHRjNG1RZFJNTmdoS24wUzFSbXZvSXoxeHVXOFRDUT09Cg==",
-      "url": "https://github.com/Termnix-IT/grok-build-desktop/releases/download/v0.0.2/Grok.Build.Desktop_0.0.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRY05zVnRVSENoNkIvNmtBUlN6YUxaMW90ME8zQnNjM3Q3RmVBajNYSnhqcVl4bmEweUc5a1lZcy9IejBnOXZsTk1wWjJZSHNJc29KY0F1VWFVb0tibXVJdk1UdHd1T1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODA0NDczCWZpbGU6R3JvayBCdWlsZCBEZXNrdG9wXzAuMC4zX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjAuMwpXQWcyQkNxTDBsVUVSVUI5cmRaTnMrWDhhOXUzVkhNbVVWcys2ODEvZFlqVG9KQ3dZRUdRdzJZSnpRclFGMlZPcE9wM3RKSnNsc0MzUU5wTkZSaWtCZz09Cg==",
+      "url": "https://github.com/Termnix-IT/grok-build-desktop/releases/download/v0.0.3/Grok.Build.Desktop_0.0.3_x64-setup.exe"
     }
   }
 }
