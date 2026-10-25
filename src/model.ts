@@ -61,6 +61,8 @@ export interface PermissionRequest {
   id: number;
   tool: ToolPayload;
   options: PermissionOption[];
+  reason: string;
+  detail: string;
 }
 
 export type TranscriptItem =
@@ -492,7 +494,7 @@ function parsePermission(event: Record<string, unknown>): PermissionRequest {
         return { optionId: text(row.optionId), name: text(row.name), kind: text(row.kind) };
       })
     : [];
-  return { id: number(event.id), tool, options };
+  return { id: number(event.id), tool, options, reason: text(event.reason), detail: text(event.detail) };
 }
 
 function nextId(state: DeskState, prefix: string) {

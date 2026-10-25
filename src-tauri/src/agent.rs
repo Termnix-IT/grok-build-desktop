@@ -40,6 +40,7 @@ pub struct AgentState {
     mirror: Arc<Mutex<Mirror>>,
     images: Arc<ImageStore>,
     prompt_image: Arc<AtomicBool>,
+    auto_approve: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -182,6 +183,7 @@ struct Shared {
     mirror: Arc<Mutex<Mirror>>,
     images: Arc<ImageStore>,
     prompt_image: Arc<AtomicBool>,
+    auto_approve: Arc<AtomicBool>,
     replay_buf: Mutex<Vec<Value>>,
 }
 
@@ -217,6 +219,7 @@ impl AgentState {
         let mirror = Arc::new(Mutex::new(Mirror::default()));
         let images = Arc::new(ImageStore::new());
         let prompt_image = Arc::new(AtomicBool::new(false));
+        let auto_approve = Arc::new(AtomicBool::new(true));
         let thread_wake = wake.clone();
         let thread_shutdown = shutdown.clone();
         let thread_folder = folder.clone();
@@ -224,6 +227,7 @@ impl AgentState {
         let thread_mirror = mirror.clone();
         let thread_images = images.clone();
         let thread_prompt_image = prompt_image.clone();
+        let thread_auto_approve = auto_approve.clone();
         let join = std::thread::Builder::new()
             .name("grok-acp".into())
             .spawn(move || {
@@ -237,6 +241,7 @@ impl AgentState {
                     thread_mirror,
                     thread_images,
                     thread_prompt_image,
+                    thread_auto_approve,
                 )
             })
             .expect("acp thread");
@@ -249,8 +254,13 @@ impl AgentState {
             mirror,
             images,
             prompt_image,
+            auto_approve,
             join: Mutex::new(Some(join)),
         }
+    }
+
+    pub fn set_auto_approve(&self, enabled: bool) {
+        self.auto_approve.store(enabled, Ordering::SeqCst);
     }
 
     pub fn shutdown(&self) {
@@ -526,6 +536,7 @@ fn agent_thread(
     mirror: Arc<Mutex<Mirror>>,
     images: Arc<ImageStore>,
     prompt_image: Arc<AtomicBool>,
+    auto_approve: Arc<AtomicBool>,
 ) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -548,6 +559,7 @@ fn agent_thread(
             mirror,
             images,
             prompt_image,
+            auto_approve,
             replay_buf: Mutex::new(Vec::new()),
         });
         loop {
@@ -602,6 +614,26 @@ async fn run_connection(
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, connection| {
+                let tool = serde_json::to_value(&request.tool_call).unwrap_or(Value::Null);
+                let options = serde_json::to_value(&request.options).unwrap_or(json!([]));
+                let folder = lock(&permission_shared.folder).clone();
+                let verdict = crate::permit::review(&tool, &options, folder.as_deref());
+                if permission_shared.auto_approve.load(Ordering::SeqCst) {
+                    if let Some(option_id) = verdict.allow_once.clone() {
+                        let spawned = connection.spawn(async move {
+                            let _ = responder.respond(RequestPermissionResponse::new(
+                                RequestPermissionOutcome::Selected(
+                                    SelectedPermissionOutcome::new(option_id),
+                                ),
+                            ));
+                            Ok(())
+                        });
+                        if spawned.is_err() {
+                            emit_error(&permission_shared, "自動承認を返せませんでした");
+                        }
+                        return Ok(());
+                    }
+                }
                 let (tx, rx) = oneshot::channel();
                 let id = permission_shared.permits.insert(tx);
                 emit(
@@ -610,8 +642,10 @@ async fn run_connection(
                         "type": "permission",
                         "id": id,
                         "sessionId": request.session_id.to_string(),
-                        "tool": serde_json::to_value(&request.tool_call).unwrap_or(Value::Null),
-                        "options": serde_json::to_value(&request.options).unwrap_or(json!([])),
+                        "tool": tool,
+                        "options": options,
+                        "reason": verdict.reason,
+                        "detail": verdict.detail,
                     }),
                 );
                 let spawned = connection.spawn(async move {

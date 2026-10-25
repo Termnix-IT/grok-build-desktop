@@ -32,8 +32,19 @@ const LAST_KEY = "gbd-last-folder";
 const OPEN_KEY = "gbd-open-tools";
 const VIEW_KEY = "gbd-transcript-view";
 const CONTEXT_KEY = "gbd-context-open";
+const AUTO_KEY = "gbd-auto-approve";
+const MOTION_KEY = "gbd-motion";
 
 type TranscriptView = "chat" | "thought" | "all";
+type SettingsPage = "display" | "approval" | "usage" | "commands" | "app";
+
+const SETTINGS_PAGES: { id: SettingsPage; label: string }[] = [
+  { id: "display", label: "表示" },
+  { id: "approval", label: "自動承認" },
+  { id: "usage", label: "使用量" },
+  { id: "commands", label: "コマンド一覧" },
+  { id: "app", label: "このアプリ" },
+];
 
 const TRANSCRIPT_VIEWS: { id: TranscriptView; label: string }[] = [
   { id: "chat", label: "会話と結果" },
@@ -172,6 +183,9 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [transcriptView, setTranscriptView] = useState<TranscriptView>(readView);
   const [contextOpen, setContextOpen] = useState(() => localStorage.getItem(CONTEXT_KEY) !== "0");
+  const [autoApprove, setAutoApprove] = useState(() => localStorage.getItem(AUTO_KEY) !== "0");
+  const [motion, setMotion] = useState(() => localStorage.getItem(MOTION_KEY) !== "0");
+  const [settingsPage, setSettingsPage] = useState<SettingsPage>("display");
   const [treeOpen, setTreeOpen] = useState(true);
   const [accountUsage, setAccountUsage] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -193,6 +207,7 @@ export default function App() {
   const takeFilesRef = useRef<(dropped: File[]) => void>(() => {});
 
   useEffect(() => {
+    void invoke("set_auto_approve", { enabled: localStorage.getItem(AUTO_KEY) !== "0" });
     let frame = 0;
     const queue: Record<string, unknown>[] = [];
     const flush = () => {
@@ -570,6 +585,11 @@ export default function App() {
     localStorage.setItem(CONTEXT_KEY, open ? "1" : "0");
   }
 
+  function setMotionEnabled(enabled: boolean) {
+    setMotion(enabled);
+    localStorage.setItem(MOTION_KEY, enabled ? "1" : "0");
+  }
+
   async function checkUpdate() {
     setUpdateBusy(true);
     const previous = updateRef.current;
@@ -703,7 +723,7 @@ export default function App() {
     (desk.sessionId ? "無題" : "");
 
   return (
-    <div className={contextOpen ? "desk" : "desk context-shut"}>
+    <div className={`desk${contextOpen ? "" : " context-shut"}${motion ? " motion" : ""}`}>
       <aside className="rail">
         <label className="finder">
           <SearchIcon />
@@ -715,13 +735,14 @@ export default function App() {
           />
         </label>
         <button className="new-chat" type="button" disabled={!folder || desk.busy} onClick={startSession}>
-          <span aria-hidden="true">+</span>
-          新規
+          <ChatIcon />
+          新規チャット
         </button>
-        <div className="folder-line">
-          <i />
-          <button type="button" aria-label="フォルダを追加" onClick={() => void browseFolder()}>+</button>
-        </div>
+        <button className="new-chat" type="button" onClick={() => void browseFolder()}>
+          <FolderIcon />
+          新規プロジェクト
+        </button>
+        <div className="folder-line" />
         <div className="folder-scroll">
           {folders.map((path) => {
             const selected = path === folder;
@@ -927,7 +948,7 @@ export default function App() {
               />
               <div className="composer-bar">
                 <button type="button" className="orb ghost" aria-label="ファイルを添付" disabled={!desk.sessionId || desk.loading} onClick={insertAt}>
-                  +
+                  <PlusIcon />
                 </button>
                 <span className="composer-spacer" />
                 {desk.busy ? (
@@ -991,8 +1012,8 @@ export default function App() {
         </div>
       </main>
 
-      {contextOpen && (
-      <aside className="context">
+      <aside className="context" aria-hidden={!contextOpen} inert={!contextOpen}>
+        <div className="context-body">
         <section className="side-card">
           <div className="side-head">
             <h2>コンテキスト</h2>
@@ -1040,8 +1061,8 @@ export default function App() {
             圧縮
           </button>
         </section>
+        </div>
       </aside>
-      )}
 
       {settingsOpen && (
         <div className="modal" onMouseDown={() => setSettingsOpen(false)}>
@@ -1055,58 +1076,131 @@ export default function App() {
             <h2>設定</h2>
             <button type="button" aria-label="閉じる" onClick={() => setSettingsOpen(false)}>×</button>
           </header>
-          <div className="settings-frame">
-            <h3>セッション会話表示調整</h3>
-            <div className="view-switch" role="radiogroup" aria-label="セッション会話表示調整">
-              {TRANSCRIPT_VIEWS.map((view) => {
-                const selected = transcriptView === view.id;
+          <div className="settings-body">
+            <div className="settings-nav" role="tablist" aria-label="設定の分類">
+              {SETTINGS_PAGES.map((page) => {
+                const selected = settingsPage === page.id;
                 return (
                   <button
-                    key={view.id}
+                    key={page.id}
                     type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    className="view-option"
-                    onClick={() => chooseView(view.id)}
+                    role="tab"
+                    aria-selected={selected}
+                    className={selected ? "on" : ""}
+                    onClick={() => setSettingsPage(page.id)}
                   >
-                    <span className="quiet-check" aria-hidden="true">{selected ? "✓" : ""}</span>
-                    {view.label}
+                    {page.label}
                   </button>
                 );
               })}
             </div>
-          </div>
-          <h3>Grok の使用量</h3>
-          <button type="button" className="pill" disabled={!desk.sessionId || desk.busy || desk.loading} onClick={askUsage}>
-            使用量を確認
-          </button>
-          {accountUsage && <p className="settings-copy">{accountUsage}</p>}
-          {desk.commands.length > 0 && <h3>コマンド</h3>}
-          {desk.commands.length > 0 && (
-            <ul className="settings-commands">
-              {desk.commands.map((command) => (
-                <li key={command.name}>
-                  <button type="button" title={command.description || undefined} onClick={() => insertCommand(command.name)}>
-                    <code>/{command.name}</code>
+            <div className="settings-pane" role="tabpanel">
+              {settingsPage === "display" && (
+                <>
+                  <div className="settings-frame">
+                    <h3>セッション会話表示調整</h3>
+                    <div className="view-switch" role="radiogroup" aria-label="セッション会話表示調整">
+                      {TRANSCRIPT_VIEWS.map((view) => {
+                        const selected = transcriptView === view.id;
+                        return (
+                          <button
+                            key={view.id}
+                            type="button"
+                            role="radio"
+                            aria-checked={selected}
+                            className="view-option"
+                            onClick={() => chooseView(view.id)}
+                          >
+                            <span className="quiet-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+                            {view.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="settings-frame">
+                    <h3>画面アニメーション</h3>
+                    <button
+                      type="button"
+                      role="checkbox"
+                      aria-checked={motion}
+                      className="view-option"
+                      onClick={() => setMotionEnabled(!motion)}
+                    >
+                      <span className="quiet-check" aria-hidden="true">{motion ? "✓" : ""}</span>
+                      開閉の動きを出す
+                    </button>
+                  </div>
+                </>
+              )}
+              {settingsPage === "approval" && (
+                <div className="settings-frame">
+                  <h3>自動承認</h3>
+                  <button
+                    type="button"
+                    role="checkbox"
+                    aria-checked={autoApprove}
+                    className="view-option"
+                    onClick={() => {
+                      const enabled = !autoApprove;
+                      localStorage.setItem(AUTO_KEY, enabled ? "1" : "0");
+                      setAutoApprove(enabled);
+                      void invoke("set_auto_approve", { enabled });
+                    }}
+                  >
+                    <span className="quiet-check" aria-hidden="true">{autoApprove ? "✓" : ""}</span>
+                    危険でない作業は自動で許可
                   </button>
-                </li>
-              ))}
-            </ul>
-          )}
-          <h3>このアプリ</h3>
-          <p className="settings-copy">版 {appVersion || "…"}</p>
-          <button type="button" className="pill" disabled={updateBusy} onClick={() => void checkUpdate()}>
-            新しい版を確認
-          </button>
-          {updateNote && <p className="settings-copy">{updateNote}</p>}
-          {import.meta.env.DEV && (
-            <p className="note">開発中の起動では適用できません。インストールした版で使ってください。</p>
-          )}
-          {hasUpdate && !import.meta.env.DEV && (
-            <button type="button" className="solid" disabled={updateBusy} onClick={() => setPendingApply(true)}>
-              最新の版を適用
-            </button>
-          )}
+                </div>
+              )}
+              {settingsPage === "usage" && (
+                <>
+                  <h3>Grok の使用量</h3>
+                  <button type="button" className="pill" disabled={!desk.sessionId || desk.busy || desk.loading} onClick={askUsage}>
+                    使用量を確認
+                  </button>
+                  {accountUsage && <p className="settings-copy">{accountUsage}</p>}
+                </>
+              )}
+              {settingsPage === "commands" && (
+                <>
+                  <h3>コマンド一覧</h3>
+                  {desk.commands.length === 0 ? (
+                    <p className="note">まだありません</p>
+                  ) : (
+                    <ul className="settings-commands">
+                      {desk.commands.map((command) => (
+                        <li key={command.name}>
+                          <button type="button" onClick={() => insertCommand(command.name)}>
+                            <code>/{command.name}</code>
+                            {command.description && <small>{command.description}</small>}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+              {settingsPage === "app" && (
+                <>
+                  <h3>このアプリ</h3>
+                  <p className="settings-copy">版 {appVersion || "…"}</p>
+                  <button type="button" className="pill" disabled={updateBusy} onClick={() => void checkUpdate()}>
+                    新しい版を確認
+                  </button>
+                  {updateNote && <p className="settings-copy">{updateNote}</p>}
+                  {import.meta.env.DEV && (
+                    <p className="note">開発中の起動では適用できません。インストールした版で使ってください。</p>
+                  )}
+                  {hasUpdate && !import.meta.env.DEV && (
+                    <button type="button" className="solid" disabled={updateBusy} onClick={() => setPendingApply(true)}>
+                      最新の版を適用
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
         </section>
         </div>
       )}
@@ -1280,10 +1374,14 @@ function PermissionCard({
   onDecide: (optionId: string | null) => void;
 }) {
   const large = toolLooksLikePlan(request.tool);
+  const title = request.tool.title || request.tool.name || "ツールの実行";
+  const detail = request.detail && request.detail !== title ? request.detail : "";
   return (
     <section className={large ? "permission large" : "permission"}>
       <p className="eyebrow">{large ? "プランの確認" : "許可が必要です"}</p>
-      <h3>{request.tool.title || request.tool.name || "ツールの実行"}</h3>
+      <h3>{title}</h3>
+      {request.reason && <p className="permission-reason">{request.reason}</p>}
+      {detail && <pre className="permission-detail">{detail}</pre>}
       {large && plan.length > 0 && (
         <ol>
           {plan.map((entry, index) => <li key={index}>{entry.content}</li>)}
@@ -1297,13 +1395,28 @@ function PermissionCard({
             className={option.kind.startsWith("reject") ? "danger" : "solid"}
             onClick={() => onDecide(option.optionId)}
           >
-            {option.name}
+            {optionLabel(option.kind, option.name)}
           </button>
         ))}
         <button type="button" onClick={() => onDecide(null)}>中止</button>
       </div>
     </section>
   );
+}
+
+function optionLabel(kind: string, name: string) {
+  switch (kind) {
+    case "allow_once":
+      return "一度だけ許可";
+    case "allow_always":
+      return "常に許可";
+    case "reject_once":
+      return "拒否";
+    case "reject_always":
+      return "常に拒否";
+    default:
+      return name || "選ぶ";
+  }
 }
 
 const MarkdownBody = memo(function MarkdownBody({ text, live = false }: { text: string; live?: boolean }) {
@@ -1446,7 +1559,13 @@ function ContextRing({
           transform="rotate(-90 17 17)"
         />
       </svg>
-      <span>{gauge ? usedPercent : "—"}</span>
+      {gauge ? (
+        <span className="ring-figure">{usedPercent}</span>
+      ) : (
+        <svg className="ring-mark" width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+          <path d="M12.5 17h9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      )}
     </span>
   );
 }
@@ -1466,8 +1585,42 @@ function CaptionGlyph({ kind }: { kind: "min" | "max" | "close" }) {
 function PaneGlyph() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-      <rect x="2.5" y="3" width="11" height="10" fill="none" stroke="currentColor" strokeWidth="1.15" />
-      <path d="M10 3.2v9.6" fill="none" stroke="currentColor" strokeWidth="1.15" />
+      <rect x="3.5" y="3.5" width="9" height="9" rx="1.2" fill="none" stroke="currentColor" strokeWidth="1.15" />
+      <path d="M9.5 3.5v9" fill="none" stroke="currentColor" strokeWidth="1.15" />
+      <g className="pane-chevron">
+        <path
+          d="M5.35 6.35 7.15 8 5.35 9.65"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.15"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </g>
+    </svg>
+  );
+}
+
+function ChatIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M3 3.25h10v7.1H6.2L3 12.75V3.25z" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function FolderIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M2.4 4.2h3.7l1.2 1.35h6.3v6.25H2.4V4.2z" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 3.25v9.5M3.25 8h9.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }

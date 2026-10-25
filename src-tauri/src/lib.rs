@@ -1,4 +1,5 @@
 mod agent;
+mod permit;
 mod usage;
 
 use agent::AgentState;
@@ -95,6 +96,11 @@ async fn decide_permission(
 }
 
 #[tauri::command]
+fn set_auto_approve(state: State<'_, AgentState>, enabled: bool) {
+    state.set_auto_approve(enabled);
+}
+
+#[tauri::command]
 async fn delete_session(state: State<'_, AgentState>, id: String) -> Result<(), String> {
     state.delete_session(id).await
 }
@@ -149,6 +155,7 @@ pub fn run() {
             set_mode,
             set_config,
             decide_permission,
+            set_auto_approve,
             delete_session,
             login,
             search_files,
