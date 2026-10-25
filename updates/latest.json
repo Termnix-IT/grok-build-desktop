@@ -1,11 +1,11 @@
 {
-  "version": "0.0.4",
-  "notes": "開発β v0.0.4 です。アイコンを X とカーソルに替え、設定を分類し、コンテキストの開閉に動きを付けました。危険でない作業は自動で一度だけ許可します。",
-  "pub_date": "2026-10-25T00:36:53Z",
+  "version": "0.0.5",
+  "notes": "開発β v0.0.5 です。起動時は会話欄の中央でプロジェクトを選び、送るとそのフォルダの新しいセッションになります。左のフォルダの開閉印を大きくし、開閉に動きを付けました。設定画面の大きさは固定です。",
+  "pub_date": "2026-10-25T23:32:51Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRY05zVnRVSENoNkg1d0ZzV3NjM1dWc0ZweEFVMjl3bFlsbHBLczd0clZ0RXY3SktBT0NjSHRoaVM5cjlESngxQTFJSjZtWW5ZR2ZZblhmTFhNNXN5VlQvdVRGRGcyRlFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODg4NTYwCWZpbGU6R3JvayBCdWlsZCBEZXNrdG9wXzAuMC40X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjAuNApZak9aQjBqSUNVMzI1aTlBRWdyUGVDblZyaWFBWXZQQWRjMXllOTNIdXpCREE0VE5lNlcvTjAzaWllemZxS29rMnJJamlIYzN6bmdkblhXQ2tqQ21CQT09Cg==",
-      "url": "https://github.com/Termnix-IT/grok-build-desktop/releases/download/v0.0.4/Grok.Build.Desktop_0.0.4_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRY05zVnRVSENoNkNubmd5eUJHN1Bja3JTdUpOUnJLMUtLWm5YZ2lENmRGY0tyanA4dUZnZVFJVVJUWTFXdGVBRXg5UFJYMmx3S1JVUnY5cFA2WVl1eEMwYVpxZzlkY2d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyOTcxMTE4CWZpbGU6R3JvayBCdWlsZCBEZXNrdG9wXzAuMC41X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjAuNQo5d1VkWG5uYjJ4UXUyNFpzZGUrTEg3bGNrZXNXbXlLNDZxa2xLUnhNUkV2NVJieFhyTUxxZ0xKNDlmdms5a3RIbzBzb1V1VVFUQkRrd2l4MzUyUVdCQT09Cg==",
+      "url": "https://github.com/Termnix-IT/grok-build-desktop/releases/download/v0.0.5/Grok.Build.Desktop_0.0.5_x64-setup.exe"
     }
   }
 }
