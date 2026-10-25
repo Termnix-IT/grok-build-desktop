@@ -2,7 +2,7 @@
 
 インストール済みの Grok Build と、`grok --permission-mode default agent --no-leader stdio` の ACP で会話する Windows アプリです。会話の正本は Grok のセッションに残り、このアプリはそれを写し取りません。
 
-現在の開発βは v0.0.4 です。Windows 用インストーラは、このリポジトリの prerelease にあります。v0.0.2 以降は、設定の「このアプリ」から更新できます。
+現在の開発βは v0.0.5 です。Windows 用インストーラは、このリポジトリの prerelease にあります。v0.0.2 以降は、設定の「このアプリ」から更新できます。
 
 ## 起動
 
