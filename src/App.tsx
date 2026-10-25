@@ -148,6 +148,12 @@ function baseName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
 
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
 function showsMarkdown(text: string) {
   return /```|\*\*|__|`[^`\n]+`|^\s{0,3}#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|\[[^\]]+\]\([^)]+\)/m.test(text);
 }
@@ -203,6 +209,7 @@ export default function App() {
   const pathDropAt = useRef(0);
   const updateRef = useRef<Update | null>(null);
   const sendingRef = useRef(false);
+  const sessionIdRef = useRef<string | null>(null);
   const takePathsRef = useRef<(paths: string[]) => void>(() => {});
   const takeFilesRef = useRef<(dropped: File[]) => void>(() => {});
 
@@ -474,6 +481,7 @@ export default function App() {
     if (messages.length) setDesk((current) => ({ ...current, error: messages.join(" ") }));
   }
 
+  sessionIdRef.current = desk.sessionId;
   takePathsRef.current = (paths) => {
     void stagePaths(paths);
   };
@@ -495,7 +503,24 @@ export default function App() {
     const trimmed = text.trim();
     if (sendingRef.current || desk.busy) return;
     if (!trimmed && attachedImages.length === 0) return;
+    if (!desk.sessionId && !folder) return;
     sendingRef.current = true;
+    if (!desk.sessionId) {
+      setDesk((current) => ({ ...current, loading: true, error: "" }));
+      try {
+        await invoke("set_folder", { path: folder });
+        await invoke("new_session");
+        const started = Date.now();
+        while (!sessionIdRef.current) {
+          if (Date.now() - started > 8000) throw new Error("セッションを開始できませんでした");
+          await nextFrame();
+        }
+      } catch (error) {
+        sendingRef.current = false;
+        setDesk((current) => ({ ...current, error: errorText(error), loading: false }));
+        return;
+      }
+    }
     if (!options?.preserveDraft) {
       setDraft("");
       setFiles([]);
@@ -721,6 +746,8 @@ export default function App() {
   const openTitle =
     desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title ||
     (desk.sessionId ? "無題" : "");
+  const showWelcome = !desk.sessionId && !desk.loading && desk.items.length === 0;
+  const composeReady = !desk.loading && (Boolean(desk.sessionId) || Boolean(folder));
 
   return (
     <div className={`desk${contextOpen ? "" : " context-shut"}${motion ? " motion" : ""}`}>
@@ -734,7 +761,7 @@ export default function App() {
             onChange={(event) => setSessionFilter(event.target.value)}
           />
         </label>
-        <button className="new-chat" type="button" disabled={!folder || desk.busy} onClick={startSession}>
+        <button className="new-chat" type="button" disabled={!folder || desk.busy || desk.loading} onClick={startSession}>
           <ChatIcon />
           新規チャット
         </button>
@@ -755,6 +782,7 @@ export default function App() {
                   type="button"
                   className={selected ? "folder-node on" : "folder-node"}
                   title={path}
+                  aria-expanded={open}
                   onClick={() => {
                     if (selected) {
                       setTreeOpen((current) => !current);
@@ -764,12 +792,16 @@ export default function App() {
                     void chooseFolder(path);
                   }}
                 >
-                  <span className="twist" aria-hidden="true">{selected ? (open ? "▾" : "▸") : ""}</span>
+                  <span className={open ? "twist open" : "twist"} aria-hidden="true">
+                    <svg width="15" height="15" viewBox="0 0 15 15">
+                      <path d="M5.4 3.2 10.6 7.5 5.4 11.8z" fill="currentColor" />
+                    </svg>
+                  </span>
                   {baseName(path)}
                 </button>
-                {open && (
+                <div className={open ? "tree-fold open" : "tree-fold"} inert={!open}>
                   <ul className="tree">
-                    {visibleSessions.map((session) => {
+                    {selected && visibleSessions.map((session) => {
                       const on = session.sessionId === desk.sessionId;
                       return (
                         <li key={session.sessionId} className={on ? "tree-row on" : "tree-row"}>
@@ -788,7 +820,7 @@ export default function App() {
                       );
                     })}
                   </ul>
-                )}
+                </div>
               </div>
             );
           })}
@@ -857,24 +889,38 @@ export default function App() {
             </p>
           )}
 
-          <div
-            className="transcript"
-            ref={transcriptRef}
-            onScroll={(event) => {
-              const box = event.currentTarget;
-              stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-            }}
-          >
-            {shownItems.map((item) => (
-              <Article
-                key={item.id}
-                item={item}
-                collapsed={item.kind !== "tool" || !openTools.includes(item.toolId)}
-                onToggle={toggleTool}
-              />
-            ))}
-            {desk.loading && desk.items.length === 0 && <p className="pending">読み込み中</p>}
-            {desk.busy && <p className="pending" aria-label="応答しています">…</p>}
+          <div className="transcript-wrap">
+            <div
+              className="transcript"
+              ref={transcriptRef}
+              onScroll={(event) => {
+                const box = event.currentTarget;
+                stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+              }}
+            >
+              {shownItems.map((item) => (
+                <Article
+                  key={item.id}
+                  item={item}
+                  collapsed={item.kind !== "tool" || !openTools.includes(item.toolId)}
+                  onToggle={toggleTool}
+                />
+              ))}
+              {desk.loading && desk.items.length === 0 && <p className="pending">読み込み中</p>}
+              {desk.busy && <p className="pending" aria-label="応答しています">…</p>}
+            </div>
+            {showWelcome && (
+              <div className="welcome">
+                <p className="welcome-prompt">どのプロジェクトで作業しますか？</p>
+                <ProjectPicker
+                  folder={folder}
+                  folders={folders}
+                  disabled={desk.busy}
+                  onChoose={(path) => void chooseFolder(path)}
+                  onBrowse={() => void browseFolder()}
+                />
+              </div>
+            )}
           </div>
 
           {desk.permission && (
@@ -932,8 +978,8 @@ export default function App() {
               <textarea
                 ref={inputRef}
                 value={draft}
-                placeholder="メッセージ"
-                disabled={!desk.sessionId || desk.loading}
+                placeholder={composeReady ? "メッセージ" : "プロジェクトを選択"}
+                disabled={!composeReady}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
@@ -947,7 +993,7 @@ export default function App() {
                 }}
               />
               <div className="composer-bar">
-                <button type="button" className="orb ghost" aria-label="ファイルを添付" disabled={!desk.sessionId || desk.loading} onClick={insertAt}>
+                <button type="button" className="orb ghost" aria-label="ファイルを添付" disabled={!composeReady} onClick={insertAt}>
                   <PlusIcon />
                 </button>
                 <span className="composer-spacer" />
@@ -956,7 +1002,7 @@ export default function App() {
                     <span className="stop-mark" />
                   </button>
                 ) : (
-                  <button className="orb send" type="submit" aria-label="送信" disabled={!desk.sessionId || desk.loading || (!draft.trim() && images.length === 0)}>
+                  <button className="orb send" type="submit" aria-label="送信" disabled={!composeReady || (!draft.trim() && images.length === 0)}>
                     <SendIcon />
                   </button>
                 )}
@@ -1451,6 +1497,101 @@ const MarkdownBody = memo(function MarkdownBody({ text, live = false }: { text: 
     </div>
   );
 });
+
+function ProjectPicker({
+  folder,
+  folders,
+  disabled,
+  onChoose,
+  onBrowse,
+}: {
+  folder: string;
+  folders: string[];
+  disabled: boolean;
+  onChoose: (path: string) => void;
+  onBrowse: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onPointer(event: MouseEvent) {
+      const target = event.target;
+      if (target instanceof Node && rootRef.current?.contains(target)) return;
+      setOpen(false);
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    window.addEventListener("mousedown", onPointer);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onPointer);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  return (
+    <div className="project-pick" ref={rootRef}>
+      <button
+        type="button"
+        className="project-pick-button"
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => {
+          if (folders.length === 0) {
+            onBrowse();
+            return;
+          }
+          setOpen((current) => !current);
+        }}
+      >
+        <span>{folder ? baseName(folder) : "プロジェクトを選択"}</span>
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M2.4 4.4 6 8l3.6-3.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && !disabled && (
+        <ul className="project-pick-menu" role="listbox">
+          {folders.map((path) => {
+            const selected = path === folder;
+            return (
+              <li key={path}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  className="project-pick-item"
+                  title={path}
+                  onClick={() => {
+                    setOpen(false);
+                    if (!selected) onChoose(path);
+                  }}
+                >
+                  <span className="quiet-check" aria-hidden="true">{selected ? "✓" : ""}</span>
+                  <span className="project-pick-name">{baseName(path)}</span>
+                </button>
+              </li>
+            );
+          })}
+          <li>
+            <button
+              type="button"
+              className="project-pick-item"
+              onClick={() => {
+                setOpen(false);
+                onBrowse();
+              }}
+            >
+              <span className="quiet-check" aria-hidden="true" />
+              <span>新規プロジェクト</span>
+            </button>
+          </li>
+        </ul>
+      )}
+    </div>
+  );
+}
 
 function QuietSelect({
   label,
