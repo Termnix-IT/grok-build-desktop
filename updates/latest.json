@@ -1,11 +1,11 @@
 {
-  "version": "0.0.3",
-  "notes": "開発β v0.0.3 です。枠なしの画面、会話の表示切替、フォルダのツリー、コンテキストの折りたたみ、アプリのアイコンを追加しました。",
-  "pub_date": "2026-10-24T01:20:16Z",
+  "version": "0.0.4",
+  "notes": "開発β v0.0.4 です。アイコンを X とカーソルに替え、設定を分類し、コンテキストの開閉に動きを付けました。危険でない作業は自動で一度だけ許可します。",
+  "pub_date": "2026-10-25T00:36:53Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRY05zVnRVSENoNkIvNmtBUlN6YUxaMW90ME8zQnNjM3Q3RmVBajNYSnhqcVl4bmEweUc5a1lZcy9IejBnOXZsTk1wWjJZSHNJc29KY0F1VWFVb0tibXVJdk1UdHd1T1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODA0NDczCWZpbGU6R3JvayBCdWlsZCBEZXNrdG9wXzAuMC4zX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjAuMwpXQWcyQkNxTDBsVUVSVUI5cmRaTnMrWDhhOXUzVkhNbVVWcys2ODEvZFlqVG9KQ3dZRUdRdzJZSnpRclFGMlZPcE9wM3RKSnNsc0MzUU5wTkZSaWtCZz09Cg==",
-      "url": "https://github.com/Termnix-IT/grok-build-desktop/releases/download/v0.0.3/Grok.Build.Desktop_0.0.3_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRY05zVnRVSENoNkg1d0ZzV3NjM1dWc0ZweEFVMjl3bFlsbHBLczd0clZ0RXY3SktBT0NjSHRoaVM5cjlESngxQTFJSjZtWW5ZR2ZZblhmTFhNNXN5VlQvdVRGRGcyRlFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyODg4NTYwCWZpbGU6R3JvayBCdWlsZCBEZXNrdG9wXzAuMC40X3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjAuNApZak9aQjBqSUNVMzI1aTlBRWdyUGVDblZyaWFBWXZQQWRjMXllOTNIdXpCREE0VE5lNlcvTjAzaWllemZxS29rMnJJamlIYzN6bmdkblhXQ2tqQ21CQT09Cg==",
+      "url": "https://github.com/Termnix-IT/grok-build-desktop/releases/download/v0.0.4/Grok.Build.Desktop_0.0.4_x64-setup.exe"
     }
   }
 }
