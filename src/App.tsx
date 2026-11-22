@@ -6,9 +6,26 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import Markdown from "react-markdown";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
+import { MarkdownBody } from "./MarkdownBody";
+import { AgentSettings } from "./AgentSettings";
+import { FlowTimeline, LogDrawer, StatusBadge, type LogTarget } from "./OrchestraView";
+import {
+  type LogLine,
+  type OrchestraAction,
+  type OrchestraState,
+  type Preflight,
+  type Registry,
+  type TaskRecord,
+  TASK_STATUS_LABEL,
+  initialOrchestra,
+  isLive,
+  liveTask,
+  plannerSessions,
+  projectTasks,
+  reduceOrchestra,
+  stepLabel,
+  taskBadge,
+} from "./orchestra";
 import {
   type DeskState,
   type DiffLine,
@@ -34,13 +51,15 @@ const VIEW_KEY = "gbd-transcript-view";
 const CONTEXT_KEY = "gbd-context-open";
 const AUTO_KEY = "gbd-auto-approve";
 const MOTION_KEY = "gbd-motion";
+const FLOW_KEY = "gbd-flow-mode";
 
 type TranscriptView = "chat" | "thought" | "all";
-type SettingsPage = "display" | "approval" | "usage" | "commands" | "app";
+type SettingsPage = "display" | "approval" | "agents" | "usage" | "commands" | "app";
 
 const SETTINGS_PAGES: { id: SettingsPage; label: string }[] = [
   { id: "display", label: "表示" },
   { id: "approval", label: "自動承認" },
+  { id: "agents", label: "エージェント" },
   { id: "usage", label: "使用量" },
   { id: "commands", label: "コマンド一覧" },
   { id: "app", label: "このアプリ" },
@@ -167,6 +186,11 @@ function readList(key: string) {
   }
 }
 
+function firstLine(text: string) {
+  const line = text.split(/\r?\n/).find((item) => item.trim()) ?? text;
+  return line.trim().slice(0, 80);
+}
+
 function rememberFolder(path: string) {
   const recent = [path, ...readList(RECENT_KEY).filter((item) => item !== path)].slice(0, 8);
   localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
@@ -200,6 +224,14 @@ export default function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [pendingApply, setPendingApply] = useState(false);
+  const [flowMode, setFlowMode] = useState(() => localStorage.getItem(FLOW_KEY) === "1");
+  const [orch, setOrch] = useState<OrchestraState>(initialOrchestra);
+  const [registry, setRegistry] = useState<Registry | null>(null);
+  const [logTarget, setLogTarget] = useState<LogTarget | null>(null);
+  const [pendingStart, setPendingStart] = useState<{ goal: string; preflight: Preflight } | null>(null);
+  const [pendingTaskDelete, setPendingTaskDelete] = useState<string | null>(null);
+  const [openTasks, setOpenTasks] = useState<string[]>([]);
+  const flowSendingRef = useRef(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
@@ -248,6 +280,50 @@ export default function App() {
       void unlisten.then((stop) => stop());
     };
   }, []);
+
+  useEffect(() => {
+    let frame = 0;
+    const queue: (Record<string, unknown> | OrchestraAction)[] = [];
+    const flush = () => {
+      frame = 0;
+      const batch = queue.splice(0);
+      if (batch.length === 0) return;
+      setOrch((current) => batch.reduce((state, event) => reduceOrchestra(state, event), current));
+    };
+    const push = (event: Record<string, unknown> | OrchestraAction) => {
+      queue.push(event);
+      if (!frame) frame = window.requestAnimationFrame(flush);
+    };
+    const stopEvents = listen<Record<string, unknown>>("orchestrator://event", (event) => push(event.payload));
+    const stopLogs = listen<{ nodeId?: string; lines?: LogLine[] }>("agent://log", (event) => {
+      const { nodeId, lines } = event.payload;
+      if (typeof nodeId === "string" && Array.isArray(lines)) push({ type: "log-batch", nodeId, lines });
+    });
+    void invoke<{ live?: TaskRecord | null }>("orchestrator_snapshot")
+      .then((snapshot) => {
+        if (snapshot?.live) push({ type: "task", task: snapshot.live });
+      })
+      .catch(() => {});
+    void invoke<Registry>("agents_config_get").then(setRegistry).catch(() => {});
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      void stopEvents.then((stop) => stop());
+      void stopLogs.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!folder) return;
+    let cancelled = false;
+    void invoke<TaskRecord[]>("orchestrator_tasks", { project: folder })
+      .then((tasks) => {
+        if (!cancelled) setOrch((current) => reduceOrchestra(current, { type: "tasks-loaded", project: folder, tasks }));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [folder]);
 
   useEffect(() => {
     let cancelled = false;
@@ -327,11 +403,14 @@ export default function App() {
     };
   }, []);
 
+  const viewTask = orch.activeTaskId ? orch.tasks[orch.activeTaskId] ?? null : null;
+  const viewPlanning = viewTask ? orch.planning[viewTask.id] ?? null : null;
+
   useEffect(() => {
     const box = transcriptRef.current;
     if (!box || !stickRef.current) return;
     box.scrollTop = box.scrollHeight;
-  }, [desk.items, desk.permission, desk.busy]);
+  }, [desk.items, desk.permission, desk.busy, viewTask, viewPlanning]);
 
   useEffect(() => {
     const field = inputRef.current;
@@ -483,9 +562,20 @@ export default function App() {
 
   sessionIdRef.current = desk.sessionId;
   takePathsRef.current = (paths) => {
+    if (flowMode) {
+      insertDraftPaths(paths);
+      return;
+    }
     void stagePaths(paths);
   };
   takeFilesRef.current = (dropped) => {
+    if (flowMode) {
+      const paths = dropped
+        .map((file) => (file as File & { path?: string }).path)
+        .filter((path): path is string => typeof path === "string" && path.length > 0);
+      insertDraftPaths(paths);
+      return;
+    }
     void stageDroppedFiles(dropped);
   };
 
@@ -578,7 +668,98 @@ export default function App() {
   }
 
   function send() {
+    if (flowMode) {
+      void sendFlow();
+      return;
+    }
     void submit(draft, files, images);
+  }
+
+  function flowError(error: unknown) {
+    setDesk((current) => ({ ...current, error: errorText(error) }));
+  }
+
+  async function sendFlow() {
+    const text = draft.trim();
+    if (!text || flowSendingRef.current) return;
+    flowSendingRef.current = true;
+    try {
+      if (viewTask && (viewTask.status === "waiting" || viewTask.status === "paused")) {
+        await invoke("orchestrator_answer", { taskId: viewTask.id, text });
+        stickRef.current = true;
+        setDraft("");
+        setSuggestions([]);
+        return;
+      }
+      if (!folder) return;
+      const preflight = await invoke<Preflight>("orchestrator_preflight", { project: folder });
+      if (!preflight.isGit || !preflight.hasCommit) {
+        flowError("git のリポジトリで、1 つ以上のコミットがあるフォルダを選んでください");
+        return;
+      }
+      if (preflight.dirty) {
+        setPendingStart({ goal: text, preflight });
+        return;
+      }
+      await beginTask(text);
+    } catch (error) {
+      flowError(error);
+    } finally {
+      flowSendingRef.current = false;
+    }
+  }
+
+  async function beginTask(goal: string) {
+    setPendingStart(null);
+    try {
+      const id = await invoke<string>("orchestrator_start", { project: folder, goal });
+      stickRef.current = true;
+      setDraft("");
+      setSuggestions([]);
+      setLogTarget(null);
+      setDesk((current) => ({ ...current, error: "" }));
+      setOrch((current) => reduceOrchestra(current, { type: "select", id }));
+      setOpenTasks((current) => (current.includes(id) ? current : [...current, id]));
+    } catch (error) {
+      flowError(error);
+    }
+  }
+
+  function abortLoop(taskId: string) {
+    void invoke("orchestrator_abort", { taskId }).catch(flowError);
+  }
+
+  function selectTask(id: string | null) {
+    if (id !== orch.activeTaskId) setLogTarget(null);
+    stickRef.current = true;
+    setOrch((current) => reduceOrchestra(current, { type: "select", id }));
+  }
+
+  function toggleTaskOpen(id: string) {
+    setOpenTasks((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }
+
+  function openLog(target: LogTarget) {
+    setLogTarget(target);
+    void invoke<LogLine[]>("agent_log", { nodeId: target.nodeId })
+      .then((lines) => setOrch((current) => reduceOrchestra(current, { type: "logs-loaded", nodeId: target.nodeId, lines })))
+      .catch(() => {});
+  }
+
+  function deleteTask(id: string) {
+    setPendingTaskDelete(null);
+    void invoke("orchestrator_delete", { taskId: id })
+      .then(() => {
+        if (logTarget && orch.tasks[id]?.steps.some((step) => logTarget.nodeId.startsWith(step.id))) setLogTarget(null);
+        setOrch((current) => reduceOrchestra(current, { type: "task-removed", id }));
+      })
+      .catch(flowError);
+  }
+
+  function chooseFlowMode(enabled: boolean) {
+    setFlowMode(enabled);
+    localStorage.setItem(FLOW_KEY, enabled ? "1" : "0");
+    setSuggestions([]);
   }
 
   function askUsage() {
@@ -663,6 +844,7 @@ export default function App() {
 
   async function load(id: string) {
     setPendingLoad(null);
+    selectTask(null);
     stickRef.current = true;
     setDesk((current) => ({
       ...current,
@@ -683,6 +865,11 @@ export default function App() {
   }
 
   function startSession() {
+    selectTask(null);
+    if (flowMode) {
+      inputRef.current?.focus();
+      return;
+    }
     setDesk((current) => ({
       ...current,
       loading: true,
@@ -700,6 +887,12 @@ export default function App() {
   }
 
   function attach(path: string) {
+    if (flowMode) {
+      setDraft((current) => current.replace(/(^|\s)@[^\s@]*$/, `$1${path} `));
+      setSuggestions([]);
+      inputRef.current?.focus();
+      return;
+    }
     setFiles((current) => (current.includes(path) ? current : [...current, path]));
     setDraft((current) => current.replace(/(^|\s)@[^\s@]*$/, "$1").trimEnd());
     setSuggestions([]);
@@ -715,6 +908,8 @@ export default function App() {
     inputRef.current?.focus();
   }
 
+  const closeLog = useCallback(() => setLogTarget(null), []);
+
   const toggleTool = useCallback((id: string) => {
     setOpenTools((current) => {
       const next = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
@@ -723,11 +918,25 @@ export default function App() {
     });
   }, []);
 
+  const orchTasks = orch.tasks;
+  const hiddenSessions = useMemo(() => plannerSessions(orchTasks), [orchTasks]);
   const visibleSessions = useMemo(() => {
     const needle = sessionFilter.trim().toLowerCase();
-    if (!needle) return desk.sessions;
-    return desk.sessions.filter((session) => (session.title || "無題").toLowerCase().includes(needle));
-  }, [desk.sessions, sessionFilter]);
+    const chats = desk.sessions.filter((session) => !hiddenSessions.has(session.sessionId));
+    if (!needle) return chats;
+    return chats.filter((session) => (session.title || "無題").toLowerCase().includes(needle));
+  }, [desk.sessions, sessionFilter, hiddenSessions]);
+  const visibleTasks = useMemo(() => {
+    const needle = sessionFilter.trim().toLowerCase();
+    const tasks = projectTasks(orchTasks, folder);
+    if (!needle) return tasks;
+    return tasks.filter((task) => task.goal.toLowerCase().includes(needle));
+  }, [orchTasks, folder, sessionFilter]);
+  const live = useMemo(() => liveTask(orchTasks), [orchTasks]);
+  const agents = registry?.agents ?? [];
+  const flowAnswering = Boolean(viewTask && (viewTask.status === "waiting" || viewTask.status === "paused"));
+  const flowBlocked = Boolean(live && !(flowAnswering && viewTask?.id === live.id));
+  const shownTask = viewTask ?? live;
   const folders = useMemo(() => {
     const seen = new Set<string>();
     const list: string[] = [];
@@ -743,11 +952,27 @@ export default function App() {
     () => desk.items.filter((item) => showsTranscriptItem(item, transcriptView)),
     [desk.items, transcriptView],
   );
-  const openTitle =
-    desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title ||
-    (desk.sessionId ? "無題" : "");
-  const showWelcome = !desk.sessionId && !desk.loading && desk.items.length === 0;
-  const composeReady = !desk.loading && (Boolean(desk.sessionId) || Boolean(folder));
+  const openTitle = viewTask
+    ? firstLine(viewTask.goal)
+    : desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title ||
+      (desk.sessionId ? "無題" : "");
+  const showWelcome = !viewTask && !desk.sessionId && !desk.loading && desk.items.length === 0;
+  const composeReady = flowMode
+    ? !desk.loading && Boolean(folder) && !flowBlocked
+    : !desk.loading && (Boolean(desk.sessionId) || Boolean(folder));
+  const placeholder = flowMode
+    ? !folder
+      ? "プロジェクトを選択"
+      : flowAnswering
+        ? viewTask?.status === "waiting"
+          ? "返事"
+          : "再開の指示"
+        : live
+          ? "別のタスクが動いています"
+          : "目的"
+    : composeReady
+      ? "メッセージ"
+      : "プロジェクトを選択";
 
   return (
     <div className={`desk${contextOpen ? "" : " context-shut"}${motion ? " motion" : ""}`}>
@@ -761,9 +986,14 @@ export default function App() {
             onChange={(event) => setSessionFilter(event.target.value)}
           />
         </label>
-        <button className="new-chat" type="button" disabled={!folder || desk.busy || desk.loading} onClick={startSession}>
+        <button
+          className="new-chat"
+          type="button"
+          disabled={!folder || (!flowMode && (desk.busy || desk.loading))}
+          onClick={startSession}
+        >
           <ChatIcon />
-          新規チャット
+          {flowMode ? "新規タスク" : "新規チャット"}
         </button>
         <button className="new-chat" type="button" onClick={() => void browseFolder()}>
           <FolderIcon />
@@ -801,8 +1031,70 @@ export default function App() {
                 </button>
                 <div className={open ? "tree-fold open" : "tree-fold"} inert={!open}>
                   <ul className="tree">
+                    {selected && visibleTasks.map((task) => {
+                      const on = task.id === orch.activeTaskId;
+                      const expanded = openTasks.includes(task.id) && task.steps.length > 0;
+                      return (
+                        <Fragment key={task.id}>
+                          <li className={on ? "tree-row task on" : "tree-row task"}>
+                            <button
+                              type="button"
+                              className={expanded ? "task-twist open" : "task-twist"}
+                              aria-label={expanded ? "畳む" : "開く"}
+                              aria-expanded={expanded}
+                              disabled={task.steps.length === 0}
+                              onClick={() => toggleTaskOpen(task.id)}
+                            >
+                              <svg width="11" height="11" viewBox="0 0 15 15" aria-hidden="true">
+                                <path d="M5.4 3.2 10.6 7.5 5.4 11.8z" fill="currentColor" />
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              className="session"
+                              title={task.goal}
+                              onClick={() => {
+                                selectTask(task.id);
+                                setOpenTasks((current) => (current.includes(task.id) ? current : [...current, task.id]));
+                              }}
+                            >
+                              <StatusBadge badge={taskBadge(task.status)} label={TASK_STATUS_LABEL[task.status]} />
+                              <strong>{firstLine(task.goal) || "無題"}</strong>
+                            </button>
+                            {!isLive(task.status) && (
+                              <button type="button" className="icon" aria-label="削除" onClick={() => setPendingTaskDelete(task.id)}>
+                                ×
+                              </button>
+                            )}
+                          </li>
+                          {expanded &&
+                            task.steps.map((step) => {
+                              const label = stepLabel(step, agents);
+                              const nodeId = step.run?.nodeId ?? step.planNodeId;
+                              const nodeOn = logTarget?.nodeId === nodeId;
+                              return (
+                                <li key={step.id} className={nodeOn ? "tree-row node on" : "tree-row node"}>
+                                  <button
+                                    type="button"
+                                    className="session"
+                                    title={`${label.who} · ${label.what}`}
+                                    onClick={() => {
+                                      selectTask(task.id);
+                                      openLog({ nodeId, title: `${label.who} · ${label.what}` });
+                                    }}
+                                  >
+                                    <StatusBadge badge={label.badge} />
+                                    <span className="node-who">[{label.who}]</span>
+                                    <span className="node-what">{label.what}</span>
+                                  </button>
+                                </li>
+                              );
+                            })}
+                        </Fragment>
+                      );
+                    })}
                     {selected && visibleSessions.map((session) => {
-                      const on = session.sessionId === desk.sessionId;
+                      const on = !viewTask && session.sessionId === desk.sessionId;
                       return (
                         <li key={session.sessionId} className={on ? "tree-row on" : "tree-row"}>
                           <button
@@ -898,16 +1190,22 @@ export default function App() {
                 stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
               }}
             >
-              {shownItems.map((item) => (
-                <Article
-                  key={item.id}
-                  item={item}
-                  collapsed={item.kind !== "tool" || !openTools.includes(item.toolId)}
-                  onToggle={toggleTool}
-                />
-              ))}
-              {desk.loading && desk.items.length === 0 && <p className="pending">読み込み中</p>}
-              {desk.busy && <p className="pending" aria-label="応答しています">…</p>}
+              {viewTask ? (
+                <FlowTimeline task={viewTask} agents={agents} planning={viewPlanning} onOpenLog={openLog} />
+              ) : (
+                <>
+                  {shownItems.map((item) => (
+                    <Article
+                      key={item.id}
+                      item={item}
+                      collapsed={item.kind !== "tool" || !openTools.includes(item.toolId)}
+                      onToggle={toggleTool}
+                    />
+                  ))}
+                  {desk.loading && desk.items.length === 0 && <p className="pending">読み込み中</p>}
+                  {desk.busy && <p className="pending" aria-label="応答しています">…</p>}
+                </>
+              )}
             </div>
             {showWelcome && (
               <div className="welcome">
@@ -922,6 +1220,10 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {logTarget && (
+            <LogDrawer target={logTarget} lines={orch.logs[logTarget.nodeId] ?? []} onClose={closeLog} />
+          )}
 
           {desk.permission && (
             <PermissionCard
@@ -946,7 +1248,7 @@ export default function App() {
                 send();
               }}
             >
-              {(images.length > 0 || files.length > 0) && (
+              {!flowMode && (images.length > 0 || files.length > 0) && (
                 <div className="chips">
                   {images.map((image) => (
                     <button key={image.id} type="button" className="image-chip" onClick={() => removeImage(image.id)}>
@@ -978,7 +1280,7 @@ export default function App() {
               <textarea
                 ref={inputRef}
                 value={draft}
-                placeholder={composeReady ? "メッセージ" : "プロジェクトを選択"}
+                placeholder={placeholder}
                 disabled={!composeReady}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
@@ -997,28 +1299,68 @@ export default function App() {
                   <PlusIcon />
                 </button>
                 <span className="composer-spacer" />
-                {desk.busy ? (
+                {flowMode && live && (
+                  <button type="button" className="loop-stop" onClick={() => abortLoop(live.id)}>
+                    <span className="stop-mark" aria-hidden="true" />
+                    ループを止める
+                  </button>
+                )}
+                {!flowMode && desk.busy ? (
                   <button type="button" className="orb stop" aria-label="停止" onClick={() => void invoke("cancel_turn")}>
                     <span className="stop-mark" />
                   </button>
                 ) : (
-                  <button className="orb send" type="submit" aria-label="送信" disabled={!composeReady || (!draft.trim() && images.length === 0)}>
+                  <button
+                    className="orb send"
+                    type="submit"
+                    aria-label="送信"
+                    disabled={!composeReady || (!draft.trim() && (flowMode || images.length === 0))}
+                  >
                     <SendIcon />
                   </button>
                 )}
               </div>
             </form>
             <div className="composer-meta">
-              <QuietSelect
-                label={desk.modeConfirmed ? "権限" : "未確認"}
-                value={desk.modeId}
-                align="left"
-                disabled={!desk.sessionId || desk.busy}
-                choices={modes.map((mode) => ({ value: mode.id, label: mode.label }))}
-                onChange={(modeId) => {
-                  void invoke("set_mode", { modeId }).catch((error) => setDesk((current) => ({ ...current, error: errorText(error) })));
-                }}
-              />
+              <div className="meta-left">
+                <QuietSelect
+                  label="実行"
+                  value={flowMode ? "flow" : "chat"}
+                  align="left"
+                  disabled={false}
+                  choices={[
+                    { value: "chat", label: "チャット" },
+                    { value: "flow", label: "自律実行" },
+                  ]}
+                  onChange={(value) => chooseFlowMode(value === "flow")}
+                />
+                {flowMode ? (
+                  <span className="flow-indicator" data-status={shownTask?.status ?? "idle"}>
+                    {shownTask ? (
+                      <>
+                        <StatusBadge badge={taskBadge(shownTask.status)} />
+                        {TASK_STATUS_LABEL[shownTask.status]}
+                      </>
+                    ) : (
+                      "待機"
+                    )}
+                  </span>
+                ) : (
+                  <QuietSelect
+                    label={desk.modeConfirmed ? "権限" : "未確認"}
+                    value={desk.modeId}
+                    align="left"
+                    disabled={!desk.sessionId || desk.busy}
+                    choices={modes.map((mode) => ({ value: mode.id, label: mode.label }))}
+                    onChange={(modeId) => {
+                      void invoke("set_mode", { modeId }).catch((error) => setDesk((current) => ({ ...current, error: errorText(error) })));
+                    }}
+                  />
+                )}
+              </div>
+              {flowMode ? (
+                <span className="flow-turns">{shownTask ? `${shownTask.turn} / ${shownTask.maxTurns}` : ""}</span>
+              ) : (
               <div className="meta-configs">
                 {(() => {
                   const selects = desk.configOptions.filter((option) => option.type === "select");
@@ -1053,6 +1395,7 @@ export default function App() {
                   });
                 })()}
               </div>
+              )}
             </div>
           </div>
         </div>
@@ -1199,6 +1542,7 @@ export default function App() {
                   </button>
                 </div>
               )}
+              {settingsPage === "agents" && <AgentSettings registry={registry} onChange={setRegistry} />}
               {settingsPage === "usage" && (
                 <>
                   <h3>Grok の使用量</h3>
@@ -1279,6 +1623,36 @@ export default function App() {
                   void invoke("delete_session", { id }).catch((error) => setDesk((current) => ({ ...current, error: String(error) })));
                 }}
               >
+                削除する
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingStart && (
+        <div className="modal">
+          <section>
+            <h3>未コミットの変更があります</h3>
+            <p>
+              エージェントは、この変更が残ったままのフォルダ
+              {pendingStart.preflight.branch ? `（${pendingStart.preflight.branch}）` : ""}
+              で作業します。作業前からある変更は、各ステップの差分に含めません。
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setPendingStart(null)}>やめる</button>
+              <button className="solid" type="button" onClick={() => void beginTask(pendingStart.goal)}>始める</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingTaskDelete && (
+        <div className="modal">
+          <section>
+            <h3>このタスクの記録を削除しますか</h3>
+            <p>判断と結果の記録を消します。プロジェクトのファイルと、各 CLI のセッションは残ります。</p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setPendingTaskDelete(null)}>やめる</button>
+              <button className="solid danger" type="button" onClick={() => deleteTask(pendingTaskDelete)}>
                 削除する
               </button>
             </div>
@@ -1464,39 +1838,6 @@ function optionLabel(kind: string, name: string) {
       return name || "選ぶ";
   }
 }
-
-const MarkdownBody = memo(function MarkdownBody({ text, live = false }: { text: string; live?: boolean }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [ready, setReady] = useState(live);
-  useEffect(() => {
-    if (live) return;
-    const node = ref.current;
-    if (!node || typeof IntersectionObserver === "undefined") {
-      setReady(true);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          setReady(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "700px 0px" },
-    );
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [live]);
-  return (
-    <div ref={ref} className="md">
-      {ready ? (
-        <Markdown remarkPlugins={[remarkGfm, remarkBreaks]}>{text}</Markdown>
-      ) : (
-        <p className="md-plain">{text}</p>
-      )}
-    </div>
-  );
-});
 
 function ProjectPicker({
   folder,

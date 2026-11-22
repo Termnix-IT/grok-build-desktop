@@ -1468,8 +1468,9 @@ fn grok_dir() -> PathBuf {
 }
 
 fn delete_session_cli(id: &str) -> Result<(), String> {
-    let output = Command::new("grok")
-        .args(["sessions", "delete", id])
+    let mut cmd = Command::new("grok");
+    crate::orchestra::runner::no_window(&mut cmd);
+    let output = cmd.args(["sessions", "delete", id])
         .output()
         .map_err(|error| format!("削除コマンドを起動できませんでした: {error}"))?;
     if output.status.success() {
