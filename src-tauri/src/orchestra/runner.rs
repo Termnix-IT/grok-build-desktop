@@ -187,17 +187,23 @@ fn registry_paths() -> [String; 2] {
     ]
 }
 
-fn child_path(command: &mut std::process::Command) {
+pub(super) fn child_path(command: &mut std::process::Command) {
+    // The child runs in the project folder, where an agent can leave a `node.cmd`. cmd.exe
+    // (npm's .cmd shims start `node` by name) and Node look in the current folder before PATH
+    // unless this is set, and relative PATH entries would search it too.
+    command.env("NoDefaultCurrentDirectoryInExePath", "1");
     #[cfg(windows)]
     {
         let [user, machine] = registry_paths();
-        command.env(
-            "PATH",
-            merge_paths(&std::env::var("PATH").unwrap_or_default(), &user, &machine),
-        );
+        let merged = merge_paths(&std::env::var("PATH").unwrap_or_default(), &user, &machine);
+        command.env("PATH", absolute_path_list(&merged));
     }
-    #[cfg(not(windows))]
-    let _ = command;
+}
+
+/// The PATH for a child, without the relative entries.
+#[cfg(any(windows, test))]
+fn absolute_path_list(paths: &str) -> std::ffi::OsString {
+    std::env::join_paths(search_folders(std::ffi::OsStr::new(paths))).unwrap_or_default()
 }
 
 fn absolute(path: PathBuf) -> Option<PathBuf> {
@@ -673,6 +679,21 @@ mod tests {
         std::fs::remove_file(&cmd).unwrap();
         assert!(resolve_program(dir.0.join("fake").to_str().unwrap()).is_err());
         assert!(resolve_program(dir.0.join("missing").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn child_path_keeps_only_absolute_entries() {
+        assert_eq!(
+            absolute_path_list(r".;C:\Tools;;relative\bin;D:\Other\;.."),
+            std::ffi::OsString::from(r"C:\Tools;D:\Other\")
+        );
+        let mut command = std::process::Command::new("unused");
+        child_path(&mut command);
+        let env: Vec<_> = command.get_envs().collect();
+        assert!(env.contains(&(
+            std::ffi::OsStr::new("NoDefaultCurrentDirectoryInExePath"),
+            Some(std::ffi::OsStr::new("1"))
+        )));
     }
 
     #[test]

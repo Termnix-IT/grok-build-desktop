@@ -7,6 +7,9 @@ use super::engine::{
 };
 
 const MAX_LINE: usize = 1024 * 1024;
+/// Connections served at once. More clients wait until one finishes.
+#[cfg(windows)]
+const MAX_CONNECTIONS: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
@@ -229,7 +232,11 @@ pub async fn serve(hub: Orchestra, pipe_name: &str) -> Result<(), HubError> {
     hub.set_gateway_status(GatewayStatus::Listening {
         pipe: pipe_name.to_owned(),
     });
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        let Ok(slot) = slots.clone().acquire_owned().await else {
+            return Ok(());
+        };
         if next.connect().await.is_err() {
             // A client that gave up before the connection completed must not stop the gateway.
             // The replacement is created first so the name never has no instance.
@@ -246,6 +253,7 @@ pub async fn serve(hub: Orchestra, pipe_name: &str) -> Result<(), HubError> {
         let hub = hub.clone();
         tokio::spawn(async move {
             connection(hub, connected).await;
+            drop(slot);
         });
     }
 }
@@ -296,8 +304,12 @@ async fn connection(hub: Orchestra, mut pipe: tokio::net::windows::named_pipe::N
     .unwrap_or_else(|error| error_value(&error));
     let mut bytes = serde_json::to_vec(&response).expect("JSON value is serializable");
     bytes.push(b'\n');
-    let _ = pipe.write_all(&bytes).await;
-    let _ = pipe.flush().await;
+    // A client that stops reading must not hold the connection forever.
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        pipe.write_all(&bytes).await?;
+        pipe.flush().await
+    })
+    .await;
     let _ = pipe.shutdown().await;
 }
 
@@ -308,7 +320,26 @@ pub fn client(pipe_name: &str, request: &Request) -> Result<Value, HubError> {
     if bytes.len() > MAX_LINE {
         return Err(bad_request("要求は 1 MiB 以下にしてください"));
     }
-    client_bytes(pipe_name, &bytes)
+    // `wait` may hold the connection for its timeout; anything else answers quickly.
+    let secs = match request {
+        Request::Wait { timeout_secs, .. } => timeout_secs.saturating_add(60),
+        _ => 60,
+    };
+    let pipe_name = pipe_name.to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // A blocking pipe read has no timeout, so it runs on its own thread. gbd exits right
+    // after, so a thread left waiting does not matter.
+    std::thread::spawn(move || {
+        let _ = sender.send(client_bytes(&pipe_name, &bytes));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(secs))
+        .unwrap_or_else(|_| {
+            Err(HubError::new(
+                "internal",
+                format!("Grok Build Desktop が {secs} 秒以内に応答しませんでした"),
+            ))
+        })
 }
 
 #[cfg(windows)]
@@ -364,8 +395,9 @@ mod windows {
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             },
-            EqualSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-            TokenUser,
+            EqualSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID,
+            SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+            TOKEN_USER, TokenIntegrityLevel, TokenUser,
         },
         System::{
             Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW},
@@ -392,7 +424,9 @@ mod windows {
         }
     }
 
-    fn user_sid(process: HANDLE) -> io::Result<UserSid> {
+    /// One class of the process token's information, in usize storage so that the structures
+    /// and the SID pointers in them are aligned.
+    fn token_info(process: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
         let mut token = ptr::null_mut();
         if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
@@ -400,7 +434,7 @@ mod windows {
         let token = Handle(token);
         let mut needed = 0;
         unsafe {
-            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
+            GetTokenInformation(token.0, class, ptr::null_mut(), 0, &mut needed);
         }
         if needed == 0 {
             return Err(io::Error::last_os_error());
@@ -409,7 +443,7 @@ mod windows {
         if unsafe {
             GetTokenInformation(
                 token.0,
-                TokenUser,
+                class,
                 data.as_mut_ptr().cast(),
                 needed,
                 &mut needed,
@@ -418,7 +452,25 @@ mod windows {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(UserSid(data))
+        Ok(data)
+    }
+
+    fn user_sid(process: HANDLE) -> io::Result<UserSid> {
+        token_info(process, TokenUser).map(UserSid)
+    }
+
+    /// The mandatory integrity level: the last sub-authority of the token's label SID
+    /// (0x1000 low, 0x2000 medium, 0x3000 high).
+    pub(super) fn integrity_level(process: HANDLE) -> io::Result<u32> {
+        let data = token_info(process, TokenIntegrityLevel)?;
+        unsafe {
+            let sid = (*(data.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())).Label.Sid;
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                return Err(io::Error::other("整合性レベルを読めませんでした"));
+            }
+            Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
+        }
     }
 
     pub(super) fn sid_string() -> Result<String, HubError> {
@@ -565,6 +617,17 @@ mod windows {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "接続先は現在のユーザーではありません",
+            ));
+        }
+        // A sandboxed process of the same user runs below medium. It could create the pipe
+        // while the app is closed, then read the jobs and answer with made-up results. An
+        // elevated gbd still reaches the app at medium.
+        const MEDIUM: u32 = 0x2000;
+        let required = integrity_level(unsafe { GetCurrentProcess() })?.min(MEDIUM);
+        if integrity_level(process.0)? < required {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "接続先は低い整合性レベルで動いています",
             ));
         }
         Ok(())
@@ -819,5 +882,12 @@ mod tests {
                 .unwrap()
                 .starts_with(r"\\.\pipe\grok-build-desktop-hub-S-1-5-")
         );
+    }
+
+    #[test]
+    fn reads_the_integrity_level() {
+        let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let level = windows::integrity_level(current).unwrap();
+        assert!((0x1000..=0x4000).contains(&level), "{level:#x}");
     }
 }

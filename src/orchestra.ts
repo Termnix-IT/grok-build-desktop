@@ -136,6 +136,8 @@ export interface GatewayState {
   status: GatewayStatus | null;
   accepting: boolean;
   rejections: Rejection[];
+  /** The stamp of the last change, so an older snapshot cannot overwrite it. */
+  at: number;
 }
 
 export interface OrchestraState {
@@ -154,8 +156,16 @@ export const initialOrchestra: OrchestraState = {
   touched: {},
   logs: {},
   logOrder: [],
-  gateway: { status: null, accepting: false, rejections: [] },
+  gateway: { status: null, accepting: false, rejections: [], at: 0 },
 };
+
+let lastStamp = 0;
+/** A number that only grows, used to tell whether an event or a fetch came first. Two calls in
+ * the same millisecond still get different numbers. */
+export function nextStamp(): number {
+  lastStamp = Math.max(lastStamp + 1, Date.now());
+  return lastStamp;
+}
 
 const LOG_LIMIT = 2000;
 const LOG_NODES = 50;
@@ -304,7 +314,7 @@ export type OrchestraAction =
 export function reduceOrchestra(
   state: OrchestraState,
   event: Record<string, unknown> | OrchestraAction,
-  at: number = Date.now(),
+  at: number = nextStamp(),
 ): OrchestraState {
   const row = event as Record<string, unknown>;
   switch (String(row.type ?? "")) {
@@ -339,12 +349,15 @@ export function reduceOrchestra(
     case "gateway": {
       const status = row.status as GatewayStatus | undefined;
       const rejected = row.rejected as Rejection | null | undefined;
+      // A snapshot asked for before the last gateway event would put the older state back.
+      if (typeof row.requestedAt === "number" && state.gateway.at > row.requestedAt) return state;
       return {
         ...state,
         gateway: {
           status: status && typeof status.state === "string" ? status : state.gateway.status,
           accepting: typeof row.accepting === "boolean" ? row.accepting : state.gateway.accepting,
           rejections: rejected ? [rejected, ...state.gateway.rejections].slice(0, REJECTIONS) : state.gateway.rejections,
+          at,
         },
       };
     }

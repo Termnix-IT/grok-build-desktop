@@ -166,8 +166,13 @@ impl AgentAdapter for ConfiguredAdapter {
         }
         append_line(&mut acc.stdout_tail, line);
         retain_tail_chars(&mut acc.stdout_tail, 2000);
-        if self.keeps_whole() && acc.whole.len() + line.len() < WHOLE_LIMIT {
+        if self.keeps_whole() {
+            // The result is the last JSON value, so the end of the output is kept. Cutting only
+            // at twice the limit keeps a long output from being copied on every line.
             append_line(&mut acc.whole, line);
+            if acc.whole.len() > 2 * WHOLE_LIMIT {
+                retain_tail_bytes(&mut acc.whole, WHOLE_LIMIT);
+            }
         }
         if self.spec.output == OutputFormat::AntigravityJson {
             // Parsed once at the end: the JSON may span lines and follow warning lines.
@@ -185,6 +190,7 @@ impl AgentAdapter for ConfiguredAdapter {
     }
 
     fn outcome(&self, mut acc: Accumulator, exit: &ExitInfo) -> AgentOutcome {
+        retain_tail_bytes(&mut acc.whole, WHOLE_LIMIT);
         match self.spec.output {
             // One JSON value printed over several lines; streamed chunks were already read.
             OutputFormat::GrokJson
@@ -197,6 +203,13 @@ impl AgentAdapter for ConfiguredAdapter {
             OutputFormat::AntigravityJson => {
                 if let Some(value) = last_json_object(&acc.whole) {
                     observe_antigravity(&value, &mut acc);
+                } else {
+                    // Without the result its status and refused actions are unknown.
+                    acc.failed = true;
+                    acc.failure = Some(format!(
+                        "Antigravity の結果の JSON を読み取れませんでした\n{}",
+                        acc.stdout_tail.trim_end_matches(['\r', '\n'])
+                    ));
                 }
             }
             _ => {}
@@ -226,6 +239,9 @@ impl AgentAdapter for ConfiguredAdapter {
                 acc.denied.join("、")
             ),
             (None, None) if acc.overlong => "出力の行が長すぎて読み取れませんでした".into(),
+            (None, None) if self.spec.output == OutputFormat::GrokJson && acc.grok_segment > 0 => {
+                "Grok はツールを使ったあと、最後に文章を返しませんでした".into()
+            }
             (None, None) => acc.stdout_tail.trim_end_matches(['\r', '\n']).to_owned(),
         };
         if let (Some(_), Some(failure)) = (&answer, &acc.failure)
@@ -386,10 +402,15 @@ fn observe_grok(value: &Value, acc: &mut Accumulator) {
             }
             return;
         }
-        Some("tool_call" | "tool_call_update") => {
+        Some("tool_call") => {
+            // Text written before a tool call is not the answer, even if nothing follows.
             acc.grok_segment += 1;
+            acc.grok_chunks.clear();
+            acc.grok_message_id = None;
             return;
         }
+        // An update may arrive late, between pieces of the answer, so it starts no new segment.
+        Some("tool_call_update") => return,
         Some("thought" | "usage" | "available_commands" | "end") => return,
         _ => {}
     }
@@ -653,6 +674,32 @@ mod tests {
         );
         assert_eq!(cancelled.status, RunStatus::Failed);
         assert_eq!(cancelled.summary, "消せませんでした");
+        let silent = parsed(
+            OutputFormat::GrokJson,
+            &[
+                r#"{"type":"text","data":"これから変更します"}"#,
+                r#"{"type":"tool_call","toolCallId":"c1","title":"edit","kind":"edit"}"#,
+                r#"{"type":"tool_call_update","toolCallId":"c1","status":"completed"}"#,
+                r#"{"type":"end","stopReason":"end_turn","sessionId":"s"}"#,
+            ],
+            0,
+        );
+        assert_eq!(
+            silent.summary,
+            "Grok はツールを使ったあと、最後に文章を返しませんでした"
+        );
+        let late = parsed(
+            OutputFormat::GrokJson,
+            &[
+                r#"{"type":"tool_call","toolCallId":"c1","title":"edit","kind":"edit"}"#,
+                r#"{"type":"text","data":"変更しました。"}"#,
+                r#"{"type":"tool_call_update","toolCallId":"c1","status":"completed"}"#,
+                r#"{"type":"text","data":"テストも成功しました。"}"#,
+                r#"{"type":"end","stopReason":"end_turn","sessionId":"s"}"#,
+            ],
+            0,
+        );
+        assert_eq!(late.summary, "変更しました。テストも成功しました。");
     }
 
     #[test]
@@ -734,9 +781,11 @@ mod tests {
         assert_eq!(failed.status, RunStatus::Failed);
         assert!(failed.denied_failure);
         assert_eq!(failed.summary, "Antigravity の状態: ERROR");
+        let unreadable = parsed(OutputFormat::AntigravityJson, &["not json"], 0);
+        assert_eq!(unreadable.status, RunStatus::Failed);
         assert_eq!(
-            parsed(OutputFormat::AntigravityJson, &["not json"], 0).summary,
-            "not json"
+            unreadable.summary,
+            "Antigravity の結果の JSON を読み取れませんでした\nnot json"
         );
     }
 
@@ -758,12 +807,21 @@ mod tests {
                 .iter()
                 .all(|entry| entry.chars().count() == DENIED_CHARS)
         );
-        let big = "x".repeat(WHOLE_LIMIT);
-        let grok = ConfiguredAdapter::new(spec(OutputFormat::GrokJson), 4096);
+        // A long output keeps its end, where the result is.
+        let big = "x".repeat(WHOLE_LIMIT / 2);
+        let antigravity = ConfiguredAdapter::new(spec(OutputFormat::AntigravityJson), 4096);
         let mut acc = Accumulator::default();
-        grok.observe(LogStream::Stdout, &big, &mut acc);
-        grok.observe(LogStream::Stdout, "{}", &mut acc);
-        assert!(acc.whole.len() < WHOLE_LIMIT);
+        for _ in 0..7 {
+            antigravity.observe(LogStream::Stdout, &big, &mut acc);
+            assert!(acc.whole.len() <= 2 * WHOLE_LIMIT);
+        }
+        antigravity.observe(
+            LogStream::Stdout,
+            r#"{"status":"SUCCESS","response":"最後","denied_actions":[{"display_name":"Bash"}]}"#,
+            &mut acc,
+        );
+        let result = antigravity.outcome(acc, &exit(0));
+        assert_eq!((result.summary.as_str(), result.denied.len()), ("最後", 1));
     }
 
     #[test]

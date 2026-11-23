@@ -23,6 +23,7 @@ import {
   agentName,
   initialOrchestra,
   liveRun,
+  nextStamp,
   projectTasks,
   queuedRuns,
   reduceOrchestra,
@@ -302,7 +303,7 @@ export default function App() {
       setOrch((current) => batch.reduce((state, item) => reduceOrchestra(state, item.event, item.at), current));
     };
     const push = (event: Record<string, unknown> | OrchestraAction) => {
-      queue.push({ event, at: Date.now() });
+      queue.push({ event, at: nextStamp() });
       if (queue.length >= 500) {
         flush();
         return;
@@ -320,7 +321,7 @@ export default function App() {
     const fetchTask = (taskId: string) => {
       fetching.add(taskId);
       stale.delete(taskId);
-      const requestedAt = Date.now();
+      const requestedAt = nextStamp();
       void invoke<TaskRecord | null>("orchestrator_task", { taskId })
         .then((task) => {
           if (!task) return;
@@ -350,12 +351,18 @@ export default function App() {
       const { nodeId, lines } = event.payload;
       if (typeof nodeId === "string" && Array.isArray(lines)) push({ type: "log-batch", nodeId, lines });
     });
-    const requestedAt = Date.now();
+    const requestedAt = nextStamp();
     void invoke<HubSnapshot>("orchestrator_snapshot")
       .then((snapshot) => {
         if (snapshot?.active?.length) push({ type: "tasks-loaded", project: null, tasks: snapshot.active, requestedAt });
         if (snapshot?.gateway) {
-          push({ type: "gateway", status: snapshot.gateway.status, accepting: snapshot.gateway.accepting, rejected: null });
+          push({
+            type: "gateway",
+            status: snapshot.gateway.status,
+            accepting: snapshot.gateway.accepting,
+            rejected: null,
+            requestedAt,
+          });
         }
       })
       .catch(() => {});
@@ -372,7 +379,7 @@ export default function App() {
   useEffect(() => {
     if (!folder) return;
     let cancelled = false;
-    const requestedAt = Date.now();
+    const requestedAt = nextStamp();
     void invoke<TaskRecord[]>("orchestrator_tasks", { project: folder })
       .then((tasks) => {
         if (!cancelled) pushOrchRef.current({ type: "tasks-loaded", project: folder, tasks, requestedAt });

@@ -330,13 +330,6 @@ fn tail(text: &str, limit: usize) -> String {
     let count = text.chars().count();
     text.chars().skip(count.saturating_sub(limit)).collect()
 }
-fn project_key(project: &str) -> String {
-    if cfg!(windows) {
-        project.to_lowercase()
-    } else {
-        project.to_owned()
-    }
-}
 pub fn normalize_project(project: &str) -> Result<String, HubError> {
     let path = Path::new(project)
         .canonicalize()
@@ -358,10 +351,7 @@ fn normalized_projects(projects: Vec<String>) -> Result<Vec<String>, HubError> {
     let mut normalized = Vec::new();
     for project in projects {
         let project = normalize_project(&project)?;
-        if !normalized
-            .iter()
-            .any(|p: &String| project_key(p) == project_key(&project))
-        {
+        if !normalized.contains(&project) {
             normalized.push(project);
         }
     }
@@ -563,7 +553,9 @@ impl Orchestra {
                 .gateway
                 .allowed_projects
                 .iter()
-                .any(|p| project_key(p) == project_key(project))
+                // Both sides are canonical paths with the case on disk. Comparing them without
+                // case would mix up two folders in a case-sensitive directory.
+                .any(|p| p == project)
         {
             self.gateway_event(
                 core,
@@ -627,7 +619,7 @@ impl Orchestra {
                 .get(id)
                 .filter(|task| source == Source::Manual || task.source == Source::Bot)
                 .ok_or_else(|| HubError::new("not_found", "タスクが見つかりません"))?;
-            if project_key(&task.project) != project_key(&project) {
+            if task.project != project {
                 return Err(HubError::new(
                     "project_mismatch",
                     "タスクのプロジェクトが一致しません",
@@ -652,7 +644,7 @@ impl Orchestra {
         } else {
             None
         };
-        let key = project_key(&project);
+        let key = project.clone();
         if source == Source::Bot
             && core.project_counts.get(&key).copied().unwrap_or(0)
                 >= core.registry.limits.max_consecutive_per_project
@@ -876,6 +868,8 @@ impl Orchestra {
         let limits = self.registry().limits;
         let logger = NodeLog::new(self.inner.clone(), &task.id, &run.id);
         let project = Path::new(&task.project);
+        // Set when the diff after the step failed, so its deletions are unknown.
+        let mut unverified = None;
         match git::snapshot(project).await {
             Err(error) => fail_run(
                 &mut run,
@@ -956,12 +950,17 @@ impl Orchestra {
                         });
                     }
                 }
-                let changes = git::changes(project, &snapshot, 200)
-                    .await
-                    .unwrap_or_else(|error| git::Changes {
-                        stat: format!("差分を取れませんでした: {error}"),
-                        ..Default::default()
-                    });
+                let changes = match git::changes(project, &snapshot, 200).await {
+                    Ok(changes) => changes,
+                    Err(error) => {
+                        let stat = format!("差分を取れませんでした: {error}");
+                        unverified = Some(error);
+                        git::Changes {
+                            stat,
+                            ..Default::default()
+                        }
+                    }
+                };
                 run.truncated = changes.truncated || changes.stat.chars().count() > 4000;
                 run.diff_stat = head(&changes.stat, 4000);
                 run.changed_files = changes.files;
@@ -981,9 +980,9 @@ impl Orchestra {
         );
         drop(logger); // All batches must precede the terminal Run event and waiter notification.
         run.ended_at = Some(now());
-        self.finish_run(run, &limits);
+        self.finish_run(run, &limits, unverified);
     }
-    fn finish_run(&self, mut run: RunRecord, limits: &config::Limits) {
+    fn finish_run(&self, mut run: RunRecord, limits: &config::Limits, unverified: Option<String>) {
         let mut core = lock(&self.inner.core);
         if let Some(live) = &core.live
             && let Some(message) = &live.stop_message
@@ -1041,6 +1040,11 @@ impl Orchestra {
                     "作業前からあったファイルが削除されました。確認してから再開してください: {}",
                     deleted.join(", ")
                 ));
+            } else if let Some(error) = unverified {
+                pause = Some(format!(
+                    "差分を取れなかったため、ファイルが削除されていないか確かめられません。確認してから再開してください: {}",
+                    head(&error, 300)
+                ));
             }
         }
         if task.status != TaskStatus::Closed
@@ -1087,7 +1091,7 @@ impl Orchestra {
         let mut tasks: Vec<_> = lock(&self.inner.core)
             .tasks
             .values()
-            .filter(|t| project_key(&t.project) == project_key(&normalized))
+            .filter(|t| t.project == normalized)
             .cloned()
             .collect();
         tasks.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
@@ -1250,7 +1254,7 @@ impl Orchestra {
         task.updated_at = now();
         store::save(&self.inner.tasks_dir, &task)?;
         core.streaks.remove(id);
-        core.project_counts.insert(project_key(&task.project), 0);
+        core.project_counts.insert(task.project.clone(), 0);
         core.tasks.insert(id.into(), task.clone());
         self.inner.sink.event(&OrchestratorEvent::Task { task });
         self.notify();
@@ -1258,9 +1262,7 @@ impl Orchestra {
     }
     pub fn resume_project(&self, project: &str) -> Result<(), HubError> {
         let project = normalize_project(project)?;
-        lock(&self.inner.core)
-            .project_counts
-            .insert(project_key(&project), 0);
+        lock(&self.inner.core).project_counts.insert(project, 0);
         Ok(())
     }
     pub async fn close(&self, id: &str) -> Result<(), HubError> {
@@ -1633,6 +1635,8 @@ mod tests {
     const REMOVE: &str = "Remove-Item tracked.txt; [Console]::Out.WriteLine('removed')";
     const NOISY: &str = "for ($i = 1; $i -le 2500; $i++) { [Console]::Out.WriteLine(\"line $i\") }";
     const MARK: &str = "Set-Content -Path ran.txt -Value 'x'";
+    const BREAK_GIT: &str =
+        "Add-Content -Path .git/config -Value '[broken'; [Console]::Out.WriteLine('broke')";
 
     fn run_events(records: &[Record], job: &str) -> Vec<RunStatus> {
         records
@@ -2081,6 +2085,27 @@ mod tests {
         assert_eq!(view.run.changed_files[0].change, FileChange::Deleted);
         assert_eq!(view.task.status, TaskStatus::Paused);
         assert!(view.task.pause_reason.unwrap().contains("tracked.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_diff_pauses_the_task() {
+        let kit = Kit::new(&[("break", BREAK_GIT)], |_| {}).await;
+        let view = kit.finish(&kit.submit("break", "1").await).await;
+        assert!(view.run.diff_stat.starts_with("差分を取れませんでした"));
+        assert_eq!(view.task.status, TaskStatus::Paused);
+        assert!(view.task.pause_reason.unwrap().contains("確かめられません"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_paths_keep_the_case_on_disk() {
+        let dir = std::env::temp_dir().join(format!("gbd-Case-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = normalize_project(&dir.to_string_lossy()).unwrap();
+        let lower = normalize_project(&dir.to_string_lossy().to_lowercase()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lower, original);
+        assert!(original.contains("gbd-Case-"));
     }
 
     #[tokio::test]
