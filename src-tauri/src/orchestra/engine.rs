@@ -1,7 +1,7 @@
 use super::{
-    adapter::{Accumulator, AgentAdapter, ConfiguredAdapter, DispatchRequest},
+    adapter::{Accumulator, AgentAdapter, Brief, ConfiguredAdapter, DispatchRequest},
     breaker,
-    config::{self, AgentKind, AgentSpec, Registry},
+    config::{self, AgentKind, AgentSpec, OutputFormat, Registry},
     git::{self, ChangedFile, FileChange, Preflight},
     runner::{self, Cancel, RunSpec},
     store,
@@ -228,6 +228,7 @@ pub struct LogBatch {
     pub task_id: String,
     pub node_id: String,
     pub lines: Vec<LogLine>,
+    pub brief: Vec<LogLine>,
 }
 
 pub struct LogTail {
@@ -291,7 +292,7 @@ struct Core {
     tasks: HashMap<String, TaskRecord>,
     queue: VecDeque<(String, String)>,
     live: Option<Live>,
-    logs: HashMap<String, VecDeque<LogLine>>,
+    logs: HashMap<String, JobLogs>,
     log_nodes: VecDeque<String>,
     streaks: HashMap<String, (String, u32)>,
     project_counts: HashMap<String, u32>,
@@ -317,7 +318,7 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-fn head(text: &str, limit: usize) -> String {
+pub(super) fn head(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         text.into()
     } else {
@@ -899,7 +900,8 @@ impl Orchestra {
         cancel: Cancel,
     ) {
         let limits = self.registry().limits;
-        let logger = NodeLog::new(self.inner.clone(), &task.id, &run.id);
+        let output = spec.as_ref().map_or(OutputFormat::Text, |spec| spec.output);
+        let mut logger = NodeLog::new(self.inner.clone(), &task.id, &run.id, output);
         let project = Path::new(&task.project);
         // Set when the diff after the step failed, so its deletions are unknown.
         let mut unverified = None;
@@ -928,10 +930,11 @@ impl Orchestra {
                     })?;
                     let safe_args =
                         config::expand(&spec.args, Some("<prompt>"), Some(&prompt_file), project);
-                    logger.line(
-                        LogStream::System,
-                        format!("{} {}", adapter.spec().program, safe_args.join(" ")),
-                    );
+                    logger.system(format!(
+                        "{} {}",
+                        adapter.spec().program,
+                        safe_args.join(" ")
+                    ));
                     let mut acc = Accumulator::default();
                     let exit = runner::run(
                         RunSpec {
@@ -949,10 +952,12 @@ impl Orchestra {
                             } else if stream != LogStream::System {
                                 acc.note_overlong();
                             }
-                            logger.line(stream, display);
+                            logger.line(stream, display, full);
                         },
                     )
-                    .await?;
+                    .await;
+                    logger.finish_brief();
+                    let exit = exit?;
                     Ok::<_, String>((adapter.outcome(acc, &exit), exit))
                 }
                 .await;
@@ -1000,17 +1005,14 @@ impl Orchestra {
             }
         }
         if let Some(error) = &run.error {
-            logger.line(LogStream::System, error.message.clone());
+            logger.system(error.message.clone());
         }
-        logger.line(
-            LogStream::System,
-            format!(
-                "終了コード {}",
-                run.exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "不明".into())
-            ),
-        );
+        logger.system(format!(
+            "終了コード {}",
+            run.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "不明".into())
+        ));
         drop(logger); // All batches must precede the terminal Run event and waiter notification.
         run.ended_at = Some(now());
         self.finish_run(run, &limits, unverified);
@@ -1136,6 +1138,42 @@ impl Orchestra {
     pub fn job(&self, id: &str) -> Result<JobView, HubError> {
         job_view(&lock(&self.inner.core), id)
     }
+    pub async fn restore_preview(&self, job_id: &str) -> Result<Vec<git::RestoreFile>, HubError> {
+        let (project, tree) = recovery_point(&lock(&self.inner.core), job_id)?;
+        git::restore_preview(Path::new(&project), &tree)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn restore(&self, job_id: &str) -> Result<Vec<git::RestoreFile>, HubError> {
+        // While submissions are locked, a project with no running or queued job
+        // cannot gain a job for the worker to start.
+        let _serial = self.inner.submissions.lock().await;
+        let (project, tree) = {
+            let core = lock(&self.inner.core);
+            let point = recovery_point(&core, job_id)?;
+            if core.tasks.values().any(|task| {
+                task.project == point.0 && task.runs.iter().any(|run| !run.status.finished())
+            }) {
+                return Err(HubError::new(
+                    "busy",
+                    "このプロジェクトに実行中または待機中のジョブがあるため復元できません",
+                ));
+            }
+            point
+        };
+        git::restore(Path::new(&project), &tree)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn git_init(&self, project: &Path) -> Result<Preflight, String> {
+        let _serial = self.inner.submissions.lock().await;
+        let project =
+            normalize_project(&project.to_string_lossy()).map_err(|error| error.message)?;
+        git::init(Path::new(&project)).await
+    }
+
     pub async fn wait(&self, id: &str, timeout_secs: u64) -> Result<JobView, HubError> {
         if !(1..=1800).contains(&timeout_secs) {
             return Err(HubError::new(
@@ -1363,13 +1401,19 @@ impl Orchestra {
             "gateway":{"status":core.gateway_status,"accepting":core.gateway.accepting}})
     }
     pub fn logs(&self, id: &str) -> Vec<LogLine> {
+        self.log_lines(id, true)
+    }
+    pub fn brief(&self, id: &str) -> Vec<LogLine> {
+        self.log_lines(id, false)
+    }
+    fn log_lines(&self, id: &str, raw: bool) -> Vec<LogLine> {
         lock(&self.inner.core)
             .logs
             .get(id)
-            .map(|lines| lines.iter().cloned().collect())
+            .map(|logs| logs.lines(raw).iter().cloned().collect())
             .unwrap_or_default()
     }
-    pub fn log_tail(&self, id: &str, n: usize) -> Result<LogTail, HubError> {
+    pub fn log_tail(&self, id: &str, n: usize, raw: bool) -> Result<LogTail, HubError> {
         if !(1..=200).contains(&n) {
             return Err(HubError::new(
                 "bad_request",
@@ -1378,15 +1422,18 @@ impl Orchestra {
         }
         let core = lock(&self.inner.core);
         job_view(&core, id)?;
-        let lines = core.logs.get(id);
+        let lines = core.logs.get(id).map(|logs| logs.lines(raw));
         let total = lines.map_or(0, VecDeque::len);
         let result: Vec<_> = lines
             .into_iter()
             .flatten()
             .skip(total.saturating_sub(n))
-            .map(|line| LogLine {
-                text: head(&line.text, 1000),
-                ..line.clone()
+            .cloned()
+            .map(|mut line| {
+                if raw {
+                    line.text = head(&line.text, 1000);
+                }
+                line
             })
             .collect();
         let truncated = result.first().is_some_and(|line| line.seq > 1);
@@ -1537,6 +1584,15 @@ fn cancel_queued(task: &mut TaskRecord, message: &str) -> Vec<RunRecord> {
         })
         .collect()
 }
+fn recovery_point(core: &Core, job_id: &str) -> Result<(String, String), HubError> {
+    let view = job_view(core, job_id)?;
+    let tree = view
+        .run
+        .recovery_point
+        .ok_or_else(|| HubError::new("not_found", "ジョブの作業前の地点が見つかりません"))?;
+    Ok((view.task.project, tree))
+}
+
 fn job_view(core: &Core, id: &str) -> Result<JobView, HubError> {
     for task in core.tasks.values() {
         if let Some(run) = task.runs.iter().find(|r| r.id == id) {
@@ -1559,20 +1615,62 @@ fn job_view(core: &Core, id: &str) -> Result<JobView, HubError> {
     Err(HubError::new("not_found", "ジョブが見つかりません"))
 }
 
+#[derive(Default)]
+struct JobLogs {
+    raw: VecDeque<LogLine>,
+    brief: VecDeque<LogLine>,
+}
+impl JobLogs {
+    fn lines(&self, raw: bool) -> &VecDeque<LogLine> {
+        if raw { &self.raw } else { &self.brief }
+    }
+}
+
+#[derive(Default)]
+struct PendingLog {
+    seq: u64,
+    lines: Vec<LogLine>,
+}
+impl PendingLog {
+    fn record(&mut self, kept: &mut VecDeque<LogLine>, stream: LogStream, text: String) {
+        self.seq += 1;
+        let line = LogLine {
+            seq: self.seq,
+            stream,
+            text,
+        };
+        kept.push_back(line.clone());
+        if kept.len() > LOG_LINES {
+            kept.pop_front();
+        }
+        self.lines.push(line);
+    }
+}
+
+#[derive(Default)]
+struct PendingLogs {
+    raw: PendingLog,
+    brief: PendingLog,
+}
+
 struct LogBuffer {
     inner: Arc<Inner>,
     task_id: String,
     node_id: String,
-    pending: Mutex<(u64, Vec<LogLine>)>,
+    pending: Mutex<PendingLogs>,
 }
 impl LogBuffer {
     fn flush(&self) {
-        let mut pending = lock(&self.pending);
-        if !pending.1.is_empty() {
+        self.emit(&mut lock(&self.pending));
+    }
+
+    fn emit(&self, pending: &mut PendingLogs) {
+        if !pending.raw.lines.is_empty() || !pending.brief.lines.is_empty() {
             self.inner.sink.logs(&LogBatch {
                 task_id: self.task_id.clone(),
                 node_id: self.node_id.clone(),
-                lines: std::mem::take(&mut pending.1),
+                lines: std::mem::take(&mut pending.raw.lines),
+                brief: std::mem::take(&mut pending.brief.lines),
             });
         }
     }
@@ -1580,14 +1678,15 @@ impl LogBuffer {
 struct NodeLog {
     buffer: Arc<LogBuffer>,
     stop: Cancel,
+    brief: Brief,
 }
 impl NodeLog {
-    fn new(inner: Arc<Inner>, task_id: &str, node_id: &str) -> Self {
+    fn new(inner: Arc<Inner>, task_id: &str, node_id: &str, output: OutputFormat) -> Self {
         {
             // Memory holds the logs of the most recent jobs only; older ones are dropped whole.
             let mut core = lock(&inner.core);
             if !core.logs.contains_key(node_id) {
-                core.logs.insert(node_id.into(), VecDeque::new());
+                core.logs.insert(node_id.into(), JobLogs::default());
                 core.log_nodes.push_back(node_id.into());
                 while core.log_nodes.len() > LOG_NODES {
                     if let Some(old) = core.log_nodes.pop_front() {
@@ -1600,7 +1699,7 @@ impl NodeLog {
             inner,
             task_id: task_id.into(),
             node_id: node_id.into(),
-            pending: Mutex::new((0, Vec::new())),
+            pending: Mutex::default(),
         });
         let weak = Arc::downgrade(&buffer);
         let stop = Cancel::new();
@@ -1619,35 +1718,47 @@ impl NodeLog {
                 }
             }
         });
-        Self { buffer, stop }
+        Self {
+            buffer,
+            stop,
+            brief: Brief::new(output),
+        }
     }
-    fn line(&self, stream: LogStream, text: String) {
+
+    fn system(&mut self, text: String) {
+        self.line(LogStream::System, text, None);
+    }
+
+    fn line(&mut self, stream: LogStream, text: String, full: Option<&str>) {
+        let brief = self.brief.feed(stream, full.unwrap_or(&text));
+        self.record(stream, Some(text), brief);
+    }
+
+    fn finish_brief(&mut self) {
+        let brief = self.brief.finish();
+        self.record(LogStream::Stdout, None, brief);
+    }
+
+    fn record(&self, stream: LogStream, raw: Option<String>, brief: Vec<String>) {
         let mut pending = lock(&self.buffer.pending);
-        pending.0 += 1;
-        let line = LogLine {
-            seq: pending.0,
-            stream,
-            text,
-        };
         {
             let mut core = lock(&self.buffer.inner.core);
-            if let Some(lines) = core.logs.get_mut(&self.buffer.node_id) {
-                lines.push_back(line.clone());
-                while lines.len() > LOG_LINES {
-                    lines.pop_front();
-                }
+            let Some(logs) = core.logs.get_mut(&self.buffer.node_id) else {
+                return;
+            };
+            if let Some(text) = raw {
+                pending.raw.record(&mut logs.raw, stream, text);
+            }
+            for text in brief {
+                pending.brief.record(&mut logs.brief, stream, text);
             }
         }
-        pending.1.push(line);
-        if pending.1.len() >= 64 {
-            self.buffer.inner.sink.logs(&LogBatch {
-                task_id: self.buffer.task_id.clone(),
-                node_id: self.buffer.node_id.clone(),
-                lines: std::mem::take(&mut pending.1),
-            });
+        if pending.raw.lines.len().max(pending.brief.lines.len()) >= 64 {
+            self.buffer.emit(&mut pending);
         }
     }
 }
+
 impl Drop for NodeLog {
     fn drop(&mut self) {
         self.stop.cancel();
@@ -1694,6 +1805,58 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn restore_is_available_for_manual_jobs_and_refused_while_project_is_busy() {
+        let kit = Kit::new(&[("edit", EDIT), ("sleep", SLEEP)], |_| {}).await;
+        let manual = kit
+            .hub
+            .submit(kit.job("edit", "依頼"), Source::Manual)
+            .await
+            .unwrap();
+        kit.finish(&manual.job_id).await;
+        let running = kit.submit("sleep", "wait").await;
+        kit.until_log(&running, "ready").await;
+        let queued = kit.submit("edit", "queued").await;
+        assert_eq!(kit.hub.job(&queued).unwrap().run.status, RunStatus::Queued);
+
+        let preview = kit.hub.restore_preview(&manual.job_id).await.unwrap();
+        assert_eq!(
+            preview,
+            [git::RestoreFile {
+                path: "tracked.txt".into(),
+                change: FileChange::Modified
+            }]
+        );
+        assert_eq!(
+            kit.hub.restore(&manual.job_id).await.unwrap_err().code,
+            "busy"
+        );
+        assert_eq!(
+            kit.hub.restore_preview(&queued).await.unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(
+            kit.hub.restore("unknown").await.unwrap_err().code,
+            "not_found"
+        );
+        kit.hub.cancel(&queued, Source::Bot).await.unwrap();
+        assert_eq!(
+            kit.hub.restore(&manual.job_id).await.unwrap_err().code,
+            "busy"
+        );
+        kit.hub.cancel(&running, Source::Bot).await.unwrap();
+        kit.finish(&running).await;
+
+        assert_eq!(kit.hub.restore(&manual.job_id).await.unwrap(), preview);
+        assert_eq!(
+            std::fs::read_to_string(kit.repo.join("tracked.txt"))
+                .unwrap()
+                .trim_end(),
+            "original"
+        );
+        assert!(kit.repo.join("new.txt").is_file());
     }
 
     #[tokio::test]
@@ -2223,10 +2386,29 @@ mod tests {
             .collect();
         assert_eq!(printed.len(), 2500);
         assert_eq!(printed[0].text, "line 1");
-        let tail = kit.hub.log_tail(&id, 3).unwrap();
+        let brief = kit.hub.brief(&id);
+        assert_eq!(brief.len(), LOG_LINES);
+        assert_eq!(brief[0].seq, kept[0].seq);
+        assert!(brief.last().unwrap().text.starts_with("[system]"));
+        let published: Vec<_> = kit
+            .records()
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Logs(batch) if batch.node_id == id => Some(batch.brief),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(published.len(), sent.len());
+        assert!(
+            published
+                .windows(2)
+                .all(|pair| pair[0].seq + 1 == pair[1].seq)
+        );
+        let tail = kit.hub.log_tail(&id, 3, true).unwrap();
         assert_eq!(tail.lines.len(), 3);
         assert!(tail.truncated);
-        assert!(kit.hub.log_tail(&id, 201).is_err());
+        assert!(kit.hub.log_tail(&id, 201, true).is_err());
     }
 
     #[tokio::test]

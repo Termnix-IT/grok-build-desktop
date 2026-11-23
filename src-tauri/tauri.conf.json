@@ -4,9 +4,9 @@
   "version": "0.0.6",
   "identifier": "com.grokbuild.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "cargo build --manifest-path src-tauri/Cargo.toml --bin gbd && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "cargo build --release --manifest-path src-tauri/Cargo.toml --bin gbd && npm run build",
     "frontendDist": "../dist"
   },
   "app": {

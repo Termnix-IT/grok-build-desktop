@@ -21,7 +21,7 @@ const USAGE: &str =
   gbd status <job_id>                状態を見る
   gbd wait <job_id> [--timeout 秒]   終わるまで待つ（既定 300、最大 1800）
   gbd result <job_id>                結果を見る
-  gbd log <job_id> [--tail 行数]     ログの末尾を見る（既定 50、最大 200）
+  gbd log <job_id> [--tail 行数] [--raw]  読みやすいログを見る（既定 50、最大 200）。--raw で CLI の出力を表示
   gbd cancel <job_id>                取り消す。実行中なら止める
   gbd agents                         使えるエージェントの一覧
   gbd version                        版とアプリへの接続を確かめる
@@ -31,6 +31,10 @@ const USAGE: &str =
   {\"project\": \"C:\\\\path\\\\to\\\\repo\", \"agent\": \"claude\", \"prompt\": \"...\",
    \"title\": \"省略可\", \"task_id\": \"省略可\", \"timeout_secs\": 省略可}
   ファイルは UTF-8 か、BOM 付きの UTF-16 で書きます。日本語は \\uXXXX と書いてもかまいません。
+
+ジョブの成否は status（succeeded / failed / timed_out / killed / cancelled）と error で判断してください。
+  CLI によっては途中で止まっても exit_code が 0 になります。
+ジョブは全プロジェクトを通じて受付順（FIFO）に 1 件ずつ動きます。同時に送ったジョブも順番を待ちます。
 
 終了コード: 0 成功、1 アプリがエラーを返したか接続できない、2 使い方かジョブファイルの誤り";
 
@@ -43,7 +47,7 @@ enum Command {
     Result(String),
     Cancel(String),
     Wait(String, u64),
-    Log(String, usize),
+    Log(String, usize, bool),
 }
 
 enum Output {
@@ -182,8 +186,11 @@ fn parse(args: &[String]) -> Result<Command, HubError> {
         }
         "log" => {
             let id = job_id(args.get(1))?;
-            let tail = number_option(&args[2..], "--tail", DEFAULT_TAIL, 1, 200)?;
-            Ok(Command::Log(id, tail))
+            let mut options = args[2..].to_vec();
+            let raw = options.iter().any(|arg| arg == "--raw");
+            options.retain(|arg| arg != "--raw");
+            let tail = number_option(&options, "--tail", DEFAULT_TAIL, 1, 200)?;
+            Ok(Command::Log(id, tail, raw))
         }
         other => Err(usage(format!("「{other}」というコマンドはありません"))),
     }
@@ -206,7 +213,12 @@ fn execute(command: Command, stdin: &mut dyn Read, pipe: &str) -> Result<Output,
             job_id,
             timeout_secs,
         },
-        Command::Log(job_id, tail) => Request::Log { v: 1, job_id, tail },
+        Command::Log(job_id, tail, raw) => Request::Log {
+            v: 1,
+            job_id,
+            tail,
+            raw,
+        },
     };
     ipc::client(pipe, &request).map(Output::Json)
 }
@@ -356,6 +368,9 @@ mod tests {
             let (text, code) = run(args, &mut &b""[..], &missing_pipe());
             assert_eq!(code, 0);
             assert!(text.contains("gbd submit") && text.contains("終了コード"));
+            for detail in ["succeeded", "timed_out", "exit_code", "FIFO", "--raw"] {
+                assert!(text.contains(detail), "{text}");
+            }
         }
         for args in [
             &["nope"][..],
@@ -368,6 +383,7 @@ mod tests {
             &["wait", "j0123456789ab", "--timeout"],
             &["wait", "j0123456789ab", "--timeout=x"],
             &["log", "j0123456789ab", "--tail", "201"],
+            &["log", "j0123456789ab", "--tail", "0", "--raw"],
             &["log", "j0123456789ab", "--lines", "5"],
             &["submit"],
             &["submit", "a.json", "b.json"],

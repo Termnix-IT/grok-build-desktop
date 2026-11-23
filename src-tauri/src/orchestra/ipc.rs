@@ -42,6 +42,8 @@ pub enum Request {
         v: u32,
         job_id: String,
         tail: usize,
+        #[serde(default)]
+        raw: bool,
     },
     Ping {
         v: u32,
@@ -133,6 +135,7 @@ fn job_value(view: &JobView) -> Value {
         "truncated": view.run.truncated,
         "error": view.run.error,
         "recovery_point": view.run.recovery_point,
+        "recovery_command": view.run.recovery_point.as_deref().map(super::git::recovery_command),
         "task": task_value(&view.task),
     })
 }
@@ -179,12 +182,14 @@ async fn handle(hub: &Orchestra, request: Request) -> Result<Value, HubError> {
             Ok(job_value(&hub.cancel(&job_id, Source::Bot).await?))
         }
         Request::Agents { .. } => Ok(json!({"ok": true, "agents": hub.agents().await})),
-        Request::Log { job_id, tail, .. } => {
+        Request::Log {
+            job_id, tail, raw, ..
+        } => {
             if !(1..=200).contains(&tail) {
                 return Err(bad_request("tail は 1〜200 にしてください"));
             }
             bot_job(hub, &job_id)?;
-            let log = hub.log_tail(&job_id, tail)?;
+            let log = hub.log_tail(&job_id, tail, raw)?;
             let lines: Vec<_> = log
                 .lines
                 .iter()
@@ -685,6 +690,15 @@ mod tests {
         value["error"]["code"].as_str().unwrap_or_default()
     }
 
+    #[test]
+    fn older_log_requests_default_to_brief() {
+        let request = serde_json::from_value::<Request>(json!({
+            "cmd": "log", "v": 1, "job_id": "j0123456789ab", "tail": 10
+        }))
+        .unwrap();
+        assert!(matches!(request, Request::Log { raw: false, .. }));
+    }
+
     #[tokio::test]
     async fn round_trip_over_the_pipe() {
         let kit = Kit::new(&[("quick", QUICK)], |_| {}).await;
@@ -753,6 +767,7 @@ mod tests {
                 v: 1,
                 job_id: job_id.clone(),
                 tail: 200,
+                raw: false,
             },
         )
         .await;
@@ -824,6 +839,7 @@ mod tests {
                 v: 1,
                 job_id: manual.job_id.clone(),
                 tail: 10,
+                raw: false,
             },
             Request::Cancel {
                 v: 1,

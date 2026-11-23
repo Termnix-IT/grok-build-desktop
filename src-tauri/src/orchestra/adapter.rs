@@ -1,9 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 
 use super::config::{self, AgentSpec, OutputFormat, PromptVia};
-use super::engine::{LogStream, RunStatus};
+use super::engine::{LogStream, RunStatus, head};
 use super::runner;
 
 pub struct DispatchRequest<'a> {
@@ -47,7 +50,7 @@ pub struct AgentOutcome {
 const WHOLE_LIMIT: usize = 1024 * 1024;
 const CHUNK_LIMIT: usize = 16000;
 const DENIED_LIMIT: usize = 20;
-const DENIED_CHARS: usize = 200;
+const DENIED_CHARS: usize = 1000;
 const GROK_DENIED_PREFIX: &str = "permission required: ";
 
 #[derive(Default)]
@@ -138,14 +141,19 @@ impl AgentAdapter for ConfiguredAdapter {
                 self.spec.id
             ));
         }
-        let prompt = (self.spec.prompt_via == PromptVia::Arg).then_some(req.prompt);
+        let prompt = if self.spec.prompt_prefix.is_empty() {
+            Cow::Borrowed(req.prompt)
+        } else {
+            Cow::Owned(format!("{}\n\n{}", self.spec.prompt_prefix, req.prompt))
+        };
+        let prompt_arg = (self.spec.prompt_via == PromptVia::Arg).then_some(prompt.as_ref());
         let prompt_file = (self.spec.prompt_via == PromptVia::File).then_some(req.prompt_file);
         Ok(LaunchPlan {
             program,
-            args: config::expand(&self.spec.args, prompt, prompt_file, req.cwd),
+            args: config::expand(&self.spec.args, prompt_arg, prompt_file, req.cwd),
             cwd: req.cwd.to_owned(),
-            stdin: (self.spec.prompt_via == PromptVia::Stdin).then(|| req.prompt.to_owned()),
-            prompt_file: prompt_file.map(|path| (path.to_owned(), req.prompt.to_owned())),
+            stdin: (self.spec.prompt_via == PromptVia::Stdin).then(|| prompt.as_ref().to_owned()),
+            prompt_file: prompt_file.map(|path| (path.to_owned(), prompt.into_owned())),
         })
     }
 
@@ -308,6 +316,301 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+const BRIEF_CHARS: usize = 1000;
+
+/// Produces readable stdout independently of the adapter's final result.
+pub struct Brief {
+    output: OutputFormat,
+    grok_text: String,
+    antigravity_pending: String,
+    antigravity_result: Option<Value>,
+}
+
+impl Brief {
+    pub fn new(output: OutputFormat) -> Self {
+        Self {
+            output,
+            grok_text: String::new(),
+            antigravity_pending: String::new(),
+            antigravity_result: None,
+        }
+    }
+
+    pub fn feed(&mut self, stream: LogStream, text: &str) -> Vec<String> {
+        match stream {
+            LogStream::Stderr => return vec![head(&format!("[stderr] {text}"), BRIEF_CHARS)],
+            LogStream::System => return vec![brief_line("[system]", text)],
+            LogStream::Stdout => {}
+        }
+        match self.output {
+            OutputFormat::Text => vec![head(text, BRIEF_CHARS)],
+            OutputFormat::AntigravityJson => self.feed_antigravity(text),
+            format => {
+                let value = serde_json::from_str::<Value>(text);
+                match (format, value) {
+                    (OutputFormat::ClaudeStreamJson, Ok(value)) => brief_claude(&value),
+                    (OutputFormat::CodexJsonl, Ok(value)) => brief_codex(&value),
+                    (OutputFormat::GrokJson, Ok(value)) => self.feed_grok(&value),
+                    (_, Err(_)) => {
+                        let mut lines = self.take_grok_text();
+                        lines.push(head(text, BRIEF_CHARS));
+                        lines
+                    }
+                    _ => Vec::new(),
+                }
+            }
+        }
+    }
+
+    pub fn finish(&mut self) -> Vec<String> {
+        let mut lines = self.take_grok_text();
+        lines.extend(self.take_antigravity_pending());
+        if let Some(value) = self.antigravity_result.take() {
+            lines.push(brief_line(
+                "[結果]",
+                str_field(&value, "response").unwrap_or(""),
+            ));
+            lines.extend(
+                entries(&value, "denied_actions")
+                    .map(|action| brief_line("[拒否]", &antigravity_denial(action))),
+            );
+        }
+        lines
+    }
+
+    fn take_grok_text(&mut self) -> Vec<String> {
+        let text = std::mem::take(&mut self.grok_text);
+        if text.is_empty() {
+            return Vec::new();
+        }
+        vec![brief_line("[文章]", &text)]
+    }
+
+    fn feed_grok(&mut self, value: &Value) -> Vec<String> {
+        let kind = str_field(value, "type");
+        if kind == Some("text") {
+            let room = BRIEF_CHARS.saturating_sub(self.grok_text.chars().count());
+            if let Some(text) = str_field(value, "data") {
+                self.grok_text.extend(text.chars().take(room));
+            }
+            return Vec::new();
+        }
+        let mut lines = self.take_grok_text();
+        match kind {
+            Some("tool_call") => {
+                let name = str_field(value, "title")
+                    .or_else(|| str_field(value, "toolName"))
+                    .unwrap_or("?");
+                let input = value.get("rawInput").unwrap_or(&Value::Null);
+                let parsed = input
+                    .as_str()
+                    .and_then(|text| serde_json::from_str(text).ok());
+                let input = parsed.as_ref().unwrap_or(input);
+                let path = input_detail(input, &["path", "file_path", "filePath"]);
+                lines.push(brief_line("[ツール]", &format!("{name} {path}")));
+            }
+            Some("tool_call_update") if str_field(value, "status") == Some("failed") => {
+                lines.push(brief_line(
+                    "[エラー]",
+                    &error_detail(value, "tool_call failed"),
+                ));
+            }
+            Some("error") => lines.push(brief_line("[エラー]", &error_detail(value, "error"))),
+            Some("end") => {
+                lines.push(brief_line(
+                    "[終了]",
+                    str_field(value, "stopReason").unwrap_or(""),
+                ));
+            }
+            _ => {}
+        }
+        lines
+    }
+
+    fn take_antigravity_pending(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.antigravity_pending)
+            .lines()
+            .map(|text| head(text, BRIEF_CHARS))
+            .collect()
+    }
+
+    fn feed_antigravity(&mut self, text: &str) -> Vec<String> {
+        if self.antigravity_pending.is_empty() && !text.trim_start().starts_with('{') {
+            return if serde_json::from_str::<Value>(text).is_ok() {
+                Vec::new()
+            } else {
+                vec![head(text, BRIEF_CHARS)]
+            };
+        }
+        append_line(&mut self.antigravity_pending, text);
+        if self.antigravity_pending.len() > WHOLE_LIMIT {
+            return self.take_antigravity_pending();
+        }
+        // Pretty-printed JSON ends with an unindented brace. Also handle a complete
+        // object on one line and fall back to the original text for malformed output.
+        if !text.trim_end().ends_with('}') && self.antigravity_pending.contains('\n') {
+            return Vec::new();
+        }
+        match serde_json::from_str::<Value>(&self.antigravity_pending) {
+            Ok(value) => {
+                self.antigravity_pending.clear();
+                if value.get("response").is_some()
+                    || value.get("denied_actions").is_some()
+                    || value.get("status").is_some()
+                {
+                    self.antigravity_result = Some(value);
+                }
+                Vec::new()
+            }
+            Err(error) if error.is_eof() => Vec::new(),
+            Err(_) => self.take_antigravity_pending(),
+        }
+    }
+}
+
+fn brief_line(label: &str, text: &str) -> String {
+    let text = text.replace(['\r', '\n'], " ");
+    head(&format!("{label} {}", text.trim()), BRIEF_CHARS)
+        .trim_end()
+        .to_owned()
+}
+
+fn entries<'a>(value: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn input_detail<'a>(input: &'a Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| str_field(input, key))
+        .unwrap_or("")
+}
+
+fn error_detail(value: &Value, fallback: &str) -> String {
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| str_field(value, "message"))
+        .or_else(|| str_field(value, "error"))
+        .or_else(|| str_field(value, "text"))
+        .or_else(|| str_field(value, "title"))
+        .or_else(|| str_field(value, "toolCallId"))
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn brief_claude(value: &Value) -> Vec<String> {
+    match (str_field(value, "type"), str_field(value, "subtype")) {
+        (Some("system"), Some("init")) => vec![brief_line(
+            "[開始]",
+            str_field(value, "model").unwrap_or(""),
+        )],
+        (Some("result"), _) => {
+            let mut lines = vec![brief_line(
+                "[結果]",
+                str_field(value, "result").unwrap_or(""),
+            )];
+            lines.extend(
+                entries(value, "permission_denials")
+                    .map(|denial| brief_line("[拒否]", &claude_denial(denial))),
+            );
+            lines
+        }
+        (Some("assistant" | "user"), _) => value
+            .get("message")
+            .into_iter()
+            .flat_map(|message| entries(message, "content"))
+            .filter_map(|item| match str_field(item, "type") {
+                Some("text") if str_field(value, "type") == Some("assistant") => {
+                    Some(brief_line("[文章]", str_field(item, "text")?))
+                }
+                Some("tool_use") => {
+                    let name = str_field(item, "name").unwrap_or("?");
+                    let detail = input_detail(
+                        &item["input"],
+                        &["file_path", "path", "command", "pattern", "url"],
+                    );
+                    Some(brief_line("[ツール]", &format!("{name} {detail}")))
+                }
+                Some("tool_result") if item["is_error"].as_bool() == Some(true) => {
+                    let detail = str_field(item, "content")
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            entries(item, "content")
+                                .filter_map(|entry| str_field(entry, "text"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        });
+                    Some(brief_line("[エラー]", &detail))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn brief_codex(value: &Value) -> Vec<String> {
+    let item = &value["item"];
+    let line = match str_field(value, "type") {
+        Some("turn.completed") => "[完了]".into(),
+        Some(kind @ ("turn.failed" | "error")) => {
+            brief_line("[エラー]", &error_detail(value, kind))
+        }
+        Some("item.started" | "item.completed") => match str_field(item, "type") {
+            Some("agent_message" | "assistant_message") => {
+                brief_line("[文章]", str_field(item, "text").unwrap_or(""))
+            }
+            Some("command_execution") => {
+                let command = str_field(item, "command").unwrap_or("");
+                let detail = item["exit_code"].as_i64().map_or_else(
+                    || command.to_owned(),
+                    |code| format!("{command} (exit {code})"),
+                );
+                brief_line("[コマンド]", &detail)
+            }
+            Some("file_change") => {
+                let paths = entries(item, "changes")
+                    .filter_map(|change| str_field(change, "path"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                brief_line("[変更]", &paths)
+            }
+            Some("mcp_tool_call") => {
+                let server = str_field(item, "server").unwrap_or("?");
+                let tool = str_field(item, "tool").unwrap_or("?");
+                brief_line("[ツール]", &format!("{server}.{tool}"))
+            }
+            Some("error") => brief_line("[エラー]", &error_detail(item, "error")),
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    vec![line]
+}
+
+fn claude_denial(denial: &Value) -> String {
+    let tool = str_field(denial, "tool_name").unwrap_or("?");
+    let input = denial.get("tool_input");
+    let detail = input
+        .and_then(|input| str_field(input, "command").or_else(|| str_field(input, "file_path")))
+        .map(str::to_owned)
+        .or_else(|| input.map(Value::to_string))
+        .unwrap_or_default();
+    format!("{tool}: {detail}")
+}
+
+fn antigravity_denial(action: &Value) -> String {
+    let name = str_field(action, "display_name").unwrap_or("?");
+    match str_field(action, "action") {
+        Some(kind) => format!("{name} ({kind})"),
+        None => name.to_owned(),
+    }
+}
+
 fn observe_claude(value: &Value, acc: &mut Accumulator) {
     match str_field(value, "type") {
         Some("result") => {
@@ -319,22 +622,8 @@ fn observe_claude(value: &Value, acc: &mut Accumulator) {
             {
                 acc.failed = true;
             }
-            for denial in value
-                .get("permission_denials")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let tool = str_field(denial, "tool_name").unwrap_or("?");
-                let input = denial.get("tool_input");
-                let detail = input
-                    .and_then(|input| {
-                        str_field(input, "command").or_else(|| str_field(input, "file_path"))
-                    })
-                    .map(str::to_owned)
-                    .or_else(|| input.map(Value::to_string))
-                    .unwrap_or_default();
-                acc.deny(&format!("{tool}: {detail}"));
+            for denial in entries(value, "permission_denials") {
+                acc.deny(&claude_denial(denial));
             }
         }
         Some("assistant") => {
@@ -449,17 +738,8 @@ fn observe_antigravity(value: &Value, acc: &mut Accumulator) {
             .map(str::to_owned)
             .or_else(|| Some(format!("Antigravity の状態: {status}")));
     }
-    for action in value
-        .get("denied_actions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let name = str_field(action, "display_name").unwrap_or("?");
-        match str_field(action, "action") {
-            Some(kind) => acc.deny(&format!("{name} ({kind})")),
-            None => acc.deny(name),
-        }
+    for action in entries(value, "denied_actions") {
+        acc.deny(&antigravity_denial(action));
     }
 }
 
@@ -477,6 +757,7 @@ mod tests {
             program: "unused".into(),
             args: vec![],
             prompt_via: PromptVia::Stdin,
+            prompt_prefix: String::new(),
             output,
             role: String::new(),
             allow_dangerous: false,
@@ -507,6 +788,155 @@ mod tests {
             .map(|line| (LogStream::Stdout, *line))
             .collect();
         run(output, &lines, code)
+    }
+
+    fn brief_lines(format: OutputFormat, stdout: &[&str]) -> Vec<String> {
+        let mut brief = Brief::new(format);
+        let mut lines: Vec<_> = stdout
+            .iter()
+            .flat_map(|line| brief.feed(LogStream::Stdout, line))
+            .collect();
+        lines.extend(brief.finish());
+        lines
+    }
+
+    #[test]
+    fn brief_claude_stream_summarizes_messages_tools_and_denials() {
+        let input = [
+            r#"{"type":"system","subtype":"init","model":"claude-sonnet"}"#,
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"確認します"},{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":[{"type":"text","text":"missing"}]},{"type":"tool_result","is_error":false,"content":"omitted"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"完了","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"pwd"}},{"tool_name":"Write","tool_input":{"file_path":"blocked.txt"}}]}"#,
+        ];
+        assert_eq!(
+            brief_lines(OutputFormat::ClaudeStreamJson, &input),
+            [
+                "[開始] claude-sonnet",
+                "[文章] 確認します",
+                "[ツール] Read src/lib.rs",
+                "[エラー] missing",
+                "[結果] 完了",
+                "[拒否] Bash: pwd",
+                "[拒否] Write: blocked.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn brief_codex_summarizes_items_and_turns() {
+        let input = [
+            r#"{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"確認しました"}}"#,
+            r#"{"type":"item.started","item":{"id":"i1","type":"command_execution","command":"Get-Location","exit_code":null}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"Get-Location","exit_code":0}}"#,
+            r#"{"type":"item.completed","item":{"id":"i2","type":"file_change","changes":[{"path":"a.txt","kind":"update"},{"path":"b.txt","kind":"add"}]}}"#,
+            r#"{"type":"item.completed","item":{"id":"i3","type":"mcp_tool_call","server":"docs","tool":"lookup"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i4","type":"error","message":"item failed"}}"#,
+            r#"{"type":"error","message":"stream error"}"#,
+            r#"{"type":"turn.failed","error":{"message":"turn failed"}}"#,
+            r#"{"type":"turn.completed","usage":{}}"#,
+        ];
+        assert_eq!(
+            brief_lines(OutputFormat::CodexJsonl, &input),
+            [
+                "[文章] 確認しました",
+                "[コマンド] Get-Location",
+                "[コマンド] Get-Location (exit 0)",
+                "[変更] a.txt, b.txt",
+                "[ツール] docs.lookup",
+                "[エラー] item failed",
+                "[エラー] stream error",
+                "[エラー] turn failed",
+                "[完了]",
+            ]
+        );
+    }
+
+    #[test]
+    fn brief_grok_joins_chunks_until_an_event_or_finish() {
+        let mut brief = Brief::new(OutputFormat::GrokJson);
+        let feed = |brief: &mut Brief, line| brief.feed(LogStream::Stdout, line);
+        assert!(feed(&mut brief, r#"{"type":"text","data":"読みま"}"#).is_empty());
+        assert!(feed(&mut brief, r#"{"type":"text","data":"す"}"#).is_empty());
+        assert_eq!(
+            feed(
+                &mut brief,
+                r#"{"type":"tool_call","title":"read_file","rawInput":{"path":"a.txt"}}"#
+            ),
+            ["[文章] 読みます", "[ツール] read_file a.txt"]
+        );
+        assert!(feed(&mut brief, r#"{"type":"thought","data":"skip this"}"#).is_empty());
+        assert_eq!(
+            feed(
+                &mut brief,
+                r#"{"type":"tool_call_update","status":"failed","error":{"message":"missing"}}"#
+            ),
+            ["[エラー] missing"]
+        );
+        assert_eq!(
+            feed(&mut brief, r#"{"type":"end","stopReason":"end_turn"}"#),
+            ["[終了] end_turn"]
+        );
+        assert!(feed(&mut brief, r#"{"type":"text","data":"最"}"#).is_empty());
+        assert!(feed(&mut brief, r#"{"type":"text","data":"後"}"#).is_empty());
+        assert_eq!(brief.finish(), ["[文章] 最後"]);
+        assert!(brief.finish().is_empty());
+    }
+
+    #[test]
+    fn brief_antigravity_reads_final_pretty_json_and_passes_through_warnings() {
+        let input = [
+            "warning before",
+            r#"{"status":"SUCCESS","response":"earlier"}"#,
+            "{",
+            r#"  "status": "SUCCESS","#,
+            r#"  "response": "完了","#,
+            r#"  "denied_actions": [{"display_name":"Bash","action":"command"},{"display_name":"Write"}]"#,
+            "}",
+            "warning after",
+        ];
+        assert_eq!(
+            brief_lines(OutputFormat::AntigravityJson, &input),
+            [
+                "warning before",
+                "warning after",
+                "[結果] 完了",
+                "[拒否] Bash (command)",
+                "[拒否] Write",
+            ]
+        );
+    }
+
+    #[test]
+    fn brief_text_and_other_streams_are_kept_with_unicode_limits() {
+        let mut brief = Brief::new(OutputFormat::Text);
+        assert_eq!(brief.feed(LogStream::Stdout, "  output  "), ["  output  "]);
+        assert_eq!(
+            brief.feed(LogStream::Stderr, "failure"),
+            ["[stderr] failure"]
+        );
+        assert_eq!(brief.feed(LogStream::System, "status"), ["[system] status"]);
+        for format in [
+            OutputFormat::Text,
+            OutputFormat::ClaudeStreamJson,
+            OutputFormat::CodexJsonl,
+            OutputFormat::GrokJson,
+            OutputFormat::AntigravityJson,
+        ] {
+            let text = "長".repeat(1100);
+            let lines = brief_lines(format, &[&text]);
+            assert_eq!(lines, [format!("{}…", "長".repeat(999))]);
+        }
+        let command = "長".repeat(1100);
+        let denied = serde_json::json!({
+            "type": "result", "subtype": "success",
+            "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": command}}],
+        })
+        .to_string();
+        let outcome = parsed(OutputFormat::ClaudeStreamJson, &[&denied], 0);
+        assert_eq!(outcome.denied[0].chars().count(), 1000);
+        assert!(outcome.denied[0].ends_with('…'));
     }
 
     #[test]
@@ -798,7 +1228,7 @@ mod tests {
         assert_eq!(result.summary, "出力の行が長すぎて読み取れませんでした");
         let mut acc = Accumulator::default();
         for index in 0..30 {
-            acc.deny(&format!("{index} {}", "x".repeat(300)));
+            acc.deny(&format!("{index} {}", "x".repeat(DENIED_CHARS + 1)));
         }
         acc.deny("");
         assert_eq!(acc.denied.len(), DENIED_LIMIT);

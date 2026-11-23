@@ -22,6 +22,9 @@ export interface LogTarget {
   title: string;
 }
 
+/** "brief" is the hub's readable lines, "raw" the CLI's own stdout and stderr. */
+export type LogView = "brief" | "raw";
+
 const BADGE_LABEL: Record<Badge, string> = {
   spin: "実行中",
   wait: "待機中",
@@ -39,21 +42,25 @@ export interface JobActions {
   onOpenLog: (target: LogTarget) => void;
   onCancel: (jobId: string) => void;
   onKill: (jobId: string) => void;
+  onRestore: (jobId: string, project: string) => void;
 }
 
 export function TaskTimeline({
   task,
   agents,
   busy,
+  restoreBlocked,
   onResume,
   onClose,
   onOpenLog,
   onCancel,
   onKill,
+  onRestore,
 }: JobActions & {
   task: TaskRecord;
   agents: AgentSpec[];
   busy: boolean;
+  restoreBlocked: boolean;
   onResume: (taskId: string) => void;
   onClose: (taskId: string) => void;
 }) {
@@ -73,7 +80,17 @@ export function TaskTimeline({
         )}
       </header>
       {task.runs.map((run) => (
-        <JobCard key={run.id} run={run} agents={agents} onOpenLog={onOpenLog} onCancel={onCancel} onKill={onKill} />
+        <JobCard
+          key={run.id}
+          run={run}
+          project={task.project}
+          agents={agents}
+          restoreBlocked={restoreBlocked}
+          onOpenLog={onOpenLog}
+          onCancel={onCancel}
+          onKill={onKill}
+          onRestore={onRestore}
+        />
       ))}
       {task.status === "paused" && (
         <article className="notice flow-stop">
@@ -97,11 +114,15 @@ export function TaskTimeline({
 
 const JobCard = memo(function JobCard({
   run,
+  project,
   agents,
+  restoreBlocked,
   ...actions
 }: JobActions & {
   run: RunRecord;
+  project: string;
   agents: AgentSpec[];
+  restoreBlocked: boolean;
 }) {
   const who = agentName(agents, run.agentId);
   const seconds =
@@ -195,12 +216,18 @@ const JobCard = memo(function JobCard({
       )}
       {run.diffStat && <pre className="flow-diff">{lastLine(run.diffStat)}</pre>}
       {run.truncated && <p className="flow-meta">差分の一部を省略しました</p>}
-      {run.recoveryPoint && <RecoveryPoint hash={run.recoveryPoint} />}
+      {run.recoveryPoint && (
+        <RecoveryPoint
+          hash={run.recoveryPoint}
+          blocked={restoreBlocked}
+          onRestore={() => actions.onRestore(run.id, project)}
+        />
+      )}
     </article>
   );
 });
 
-function RecoveryPoint({ hash }: { hash: string }) {
+function RecoveryPoint({ hash, blocked, onRestore }: { hash: string; blocked: boolean; onRestore: () => void }) {
   const [copied, setCopied] = useState("");
   const copy = (label: string, text: string) => {
     void navigator.clipboard
@@ -223,6 +250,15 @@ function RecoveryPoint({ hash }: { hash: string }) {
       >
         {copied === "restore" ? "コピーしました" : "戻すコマンド"}
       </button>
+      <button
+        type="button"
+        className="flow-log"
+        disabled={blocked}
+        title={blocked ? "このプロジェクトでジョブが動いているあいだは戻せません" : "このジョブの前の内容にファイルを戻します"}
+        onClick={onRestore}
+      >
+        作業前に戻す
+      </button>
     </p>
   );
 }
@@ -235,10 +271,14 @@ function lastLine(text: string) {
 export function LogDrawer({
   target,
   lines,
+  view,
+  onView,
   onClose,
 }: {
   target: LogTarget;
   lines: LogLine[];
+  view: LogView;
+  onView: (view: LogView) => void;
   onClose: () => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
@@ -248,7 +288,7 @@ export function LogDrawer({
 
   useEffect(() => {
     setFollow(true);
-  }, [target.nodeId]);
+  }, [target.nodeId, view]);
 
   useLayoutEffect(() => {
     const box = boxRef.current;
@@ -268,6 +308,26 @@ export function LogDrawer({
       <header className="log-head">
         <strong>{target.title}</strong>
         <span className="flow-meta">{lines.length}行</span>
+        <span className="log-views" role="radiogroup" aria-label="ログの表示">
+          {(
+            [
+              ["brief", "読みやすく"],
+              ["raw", "元の出力"],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              role="radio"
+              aria-checked={view === value}
+              className="view-option"
+              onClick={() => onView(value)}
+            >
+              <span className="quiet-check" aria-hidden="true">{view === value ? "✓" : ""}</span>
+              {label}
+            </button>
+          ))}
+        </span>
         <button
           type="button"
           role="checkbox"

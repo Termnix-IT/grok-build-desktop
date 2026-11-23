@@ -160,6 +160,40 @@ async fn orchestrator_preflight(app: tauri::AppHandle, project: String) -> Prefl
 }
 
 #[tauri::command]
+async fn orchestrator_git_init(
+    app: tauri::AppHandle,
+    project: String,
+) -> Result<Preflight, String> {
+    let state = app.state::<Orchestra>().inner().clone();
+    state.git_init(Path::new(&project)).await
+}
+
+#[derive(serde::Serialize)]
+struct RestorePreview {
+    files: Vec<orchestra::git::RestoreFile>,
+}
+
+#[tauri::command]
+async fn orchestrator_restore_preview(
+    app: tauri::AppHandle,
+    job_id: String,
+) -> Result<RestorePreview, orchestra::engine::HubError> {
+    let state = app.state::<Orchestra>().inner().clone();
+    let files = state.restore_preview(&job_id).await?;
+    Ok(RestorePreview { files })
+}
+
+#[tauri::command]
+async fn orchestrator_restore(
+    app: tauri::AppHandle,
+    job_id: String,
+) -> Result<RestorePreview, orchestra::engine::HubError> {
+    let state = app.state::<Orchestra>().inner().clone();
+    let files = state.restore(&job_id).await?;
+    Ok(RestorePreview { files })
+}
+
+#[tauri::command]
 async fn orchestrator_dispatch(
     app: tauri::AppHandle,
     project: String,
@@ -267,6 +301,11 @@ fn agent_log(state: State<'_, Orchestra>, node_id: String) -> Vec<LogLine> {
 }
 
 #[tauri::command]
+fn agent_brief(state: State<'_, Orchestra>, node_id: String) -> Vec<LogLine> {
+    state.brief(&node_id)
+}
+
+#[tauri::command]
 fn gateway_get(state: State<'_, Orchestra>) -> serde_json::Value {
     state.gateway_view()
 }
@@ -360,6 +399,9 @@ pub fn run() {
             agents_config_reset,
             agents_probe,
             orchestrator_preflight,
+            orchestrator_git_init,
+            orchestrator_restore_preview,
+            orchestrator_restore,
             orchestrator_dispatch,
             orchestrator_kill,
             orchestrator_stop_all,
@@ -375,6 +417,7 @@ pub fn run() {
             orchestrator_delete,
             orchestrator_snapshot,
             agent_log,
+            agent_brief,
             gateway_get,
             gateway_save,
             gateway_selftest

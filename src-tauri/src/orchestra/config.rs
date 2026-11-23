@@ -47,6 +47,8 @@ pub struct AgentSpec {
     pub program: String,
     pub args: Vec<String>,
     pub prompt_via: PromptVia,
+    #[serde(default)]
+    pub prompt_prefix: String,
     pub output: OutputFormat,
     pub role: String,
     pub allow_dangerous: bool,
@@ -99,6 +101,11 @@ pub fn defaults() -> Registry {
         program: program.into(),
         args: args.iter().map(|arg| (*arg).into()).collect(),
         prompt_via,
+        prompt_prefix: if kind == AgentKind::Grok {
+            "このジョブではシェルのコマンドを実行できません。実行しようとすると作業全体が止まります。ファイルの読み取り、検索、作業フォルダの中の編集だけで進めてください。".into()
+        } else {
+            String::new()
+        },
         output,
         role: role.into(),
         allow_dangerous: false,
@@ -171,7 +178,7 @@ pub fn defaults() -> Registry {
                 ],
                 PromptVia::File,
                 OutputFormat::GrokJson,
-                "コードベースの調査、小さな修正、別の視点からのレビューが得意。読み取りだけのコマンドは実行でき、ファイルを消すなどのコマンドは自動で拒否される。",
+                "コードベースの調査、小さな修正、別の視点からのレビューが得意。ファイルの読み取り、検索、作業フォルダの中の編集はできるが、シェルのコマンドは実行できず、実行しようとするとジョブ全体が失敗する。",
             ),
             agent(
                 "antigravity",
@@ -355,6 +362,11 @@ pub fn validate(registry: &Registry) -> Result<(), String> {
         if agent.role.chars().count() > 400 {
             return Err(format!("{item}.role は 400 文字以下にしてください"));
         }
+        if agent.prompt_prefix.chars().count() > 2000 {
+            return Err(format!(
+                "{item}.promptPrefix は 2000 文字以下にしてください"
+            ));
+        }
         if let Some(timeout) = agent.timeout_secs
             && !(30..=7200).contains(&timeout)
         {
@@ -482,6 +494,39 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).into()).collect()
+    }
+
+    #[test]
+    fn prompt_prefix_defaults_and_character_limit() {
+        let mut registry = defaults();
+        let grok = registry
+            .agents
+            .iter()
+            .find(|agent| agent.id == "grok")
+            .unwrap();
+        assert_eq!(
+            grok.prompt_prefix,
+            "このジョブではシェルのコマンドを実行できません。実行しようとすると作業全体が止まります。ファイルの読み取り、検索、作業フォルダの中の編集だけで進めてください。"
+        );
+        assert!(
+            registry
+                .agents
+                .iter()
+                .filter(|agent| agent.id != "grok")
+                .all(|agent| agent.prompt_prefix.is_empty())
+        );
+        let mut json = serde_json::to_value(grok).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("promptPrefix")
+            .unwrap();
+        let saved: AgentSpec = serde_json::from_value(json).unwrap();
+        assert!(saved.prompt_prefix.is_empty());
+
+        registry.agents[0].prompt_prefix = "あ".repeat(2000);
+        validate(&registry).unwrap();
+        registry.agents[0].prompt_prefix.push('あ');
+        assert!(validate(&registry).unwrap_err().contains("promptPrefix"));
     }
 
     #[test]

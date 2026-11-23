@@ -74,6 +74,7 @@ export interface AgentSpec {
   role: string;
   allowDangerous: boolean;
   timeoutSecs?: number | null;
+  promptPrefix?: string;
 }
 
 export interface Limits {
@@ -146,6 +147,8 @@ export interface OrchestraState {
   /** When this screen last heard about each task, so an older list cannot overwrite it. */
   touched: Record<string, number>;
   logs: Record<string, LogLine[]>;
+  /** The readable lines the hub makes from each CLI's output, kept next to the raw lines. */
+  briefs: Record<string, LogLine[]>;
   logOrder: string[];
   gateway: GatewayState;
 }
@@ -155,6 +158,7 @@ export const initialOrchestra: OrchestraState = {
   activeTaskId: null,
   touched: {},
   logs: {},
+  briefs: {},
   logOrder: [],
   gateway: { status: null, accepting: false, rejections: [], at: 0 },
 };
@@ -336,8 +340,8 @@ export type OrchestraAction =
   | { type: "tasks-loaded"; project: string | null; tasks: TaskRecord[]; requestedAt: number }
   | { type: "task-removed"; id: string }
   | { type: "select"; id: string | null }
-  | { type: "log-batch"; nodeId: string; lines: LogLine[] }
-  | { type: "logs-loaded"; nodeId: string; lines: LogLine[] };
+  | { type: "log-batch"; nodeId: string; lines: LogLine[]; brief?: LogLine[] }
+  | { type: "logs-loaded"; nodeId: string; lines: LogLine[]; kind: "raw" | "brief" };
 
 export function reduceOrchestra(
   state: OrchestraState,
@@ -416,10 +420,12 @@ export function reduceOrchestra(
       delete tasks[action.id];
       delete touched[action.id];
       let logs = state.logs;
+      let briefs = state.briefs;
       let logOrder = state.logOrder;
       if (task) {
         const nodes = new Set(task.runs.map((run) => run.id));
         logs = Object.fromEntries(Object.entries(state.logs).filter(([id]) => !nodes.has(id)));
+        briefs = Object.fromEntries(Object.entries(state.briefs).filter(([id]) => !nodes.has(id)));
         logOrder = state.logOrder.filter((id) => !nodes.has(id));
       }
       return {
@@ -427,6 +433,7 @@ export function reduceOrchestra(
         tasks,
         touched,
         logs,
+        briefs,
         logOrder,
         activeTaskId: state.activeTaskId === action.id ? null : state.activeTaskId,
       };
@@ -438,17 +445,26 @@ export function reduceOrchestra(
     case "log-batch":
     case "logs-loaded": {
       const action = event as Extract<OrchestraAction, { type: "log-batch" | "logs-loaded" }>;
-      if (!action.nodeId || !Array.isArray(action.lines) || action.lines.length === 0) return state;
-      const logs = { ...state.logs, [action.nodeId]: mergeLines(state.logs[action.nodeId], action.lines) };
+      if (!action.nodeId) return state;
+      const raw = action.type === "log-batch" || action.kind === "raw" ? action.lines : [];
+      const brief = action.type === "log-batch" ? action.brief ?? [] : action.kind === "brief" ? action.lines : [];
+      const hasRaw = Array.isArray(raw) && raw.length > 0;
+      const hasBrief = Array.isArray(brief) && brief.length > 0;
+      if (!hasRaw && !hasBrief) return state;
+      const logs = hasRaw ? { ...state.logs, [action.nodeId]: mergeLines(state.logs[action.nodeId], raw) } : { ...state.logs };
+      const briefs = hasBrief
+        ? { ...state.briefs, [action.nodeId]: mergeLines(state.briefs[action.nodeId], brief) }
+        : { ...state.briefs };
       let logOrder = state.logOrder.includes(action.nodeId)
         ? state.logOrder
         : [...state.logOrder, action.nodeId];
       while (logOrder.length > LOG_NODES) {
         const [oldest, ...rest] = logOrder;
         delete logs[oldest];
+        delete briefs[oldest];
         logOrder = rest;
       }
-      return { ...state, logs, logOrder };
+      return { ...state, logs, briefs, logOrder };
     }
     default:
       return state;
@@ -490,6 +506,7 @@ export function blankCustomAgent(agents: AgentSpec[]): AgentSpec {
     role: "",
     allowDangerous: false,
     timeoutSecs: null,
+    promptPrefix: "",
   };
 }
 

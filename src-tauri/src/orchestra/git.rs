@@ -238,7 +238,17 @@ impl<'a> Repo<'a> {
         env: &[(&str, &OsStr)],
         secs: u64,
     ) -> Result<Vec<u8>, String> {
-        run_git_with(self.dir, &self.filters_off, args, env, secs).await
+        self.run_input(args, env, None, secs).await
+    }
+
+    async fn run_input(
+        &self,
+        args: &[&str],
+        env: &[(&str, &OsStr)],
+        input: Option<&[u8]>,
+        secs: u64,
+    ) -> Result<Vec<u8>, String> {
+        run_git_input(self.dir, &self.filters_off, args, env, input, secs).await
     }
 
     /// Runs at the top of the working tree, where paths are relative to the whole tree, in the
@@ -355,23 +365,96 @@ pub async fn preflight(dir: &Path) -> Preflight {
     let Ok(repo) = Repo::open(dir).await else {
         return absent;
     };
+    preflight_repo(&repo).await.unwrap_or(absent)
+}
+
+async fn preflight_repo(repo: &Repo<'_>) -> Option<Preflight> {
     if repo
         .text(&["rev-parse", "--is-inside-work-tree"])
         .await
         .as_deref()
         != Some("true")
     {
-        return absent;
+        return None;
     }
     let (head, branch) = tokio::join!(
         repo.text(&["rev-parse", "--verify", "HEAD"]),
         repo.text(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
     );
-    Preflight {
+    Some(Preflight {
         is_git: true,
         has_commit: head.is_some(),
         branch: branch.filter(|s| !s.is_empty()),
+    })
+}
+
+pub async fn init(dir: &Path) -> Result<Preflight, String> {
+    init_with(dir, &[]).await
+}
+
+async fn init_with(dir: &Path, identity_env: &[(&str, &OsStr)]) -> Result<Preflight, String> {
+    if !dir.is_dir() {
+        return Err("既存のフォルダを指定してください".into());
     }
+    let locale = ("LC_ALL", OsStr::new("C"));
+    let repo = match Repo::open(dir).await {
+        Ok(repo) => repo,
+        Err(error) => {
+            match run_git_with(
+                dir,
+                &[],
+                &["rev-parse", "--is-inside-work-tree"],
+                &[locale],
+                10,
+            )
+            .await
+            {
+                Err(discovery) if discovery.starts_with("fatal: not a git repository") => {
+                    run_git_with(dir, &[], &["init", "--template="], &[], 10).await?;
+                    Repo::open(dir).await?
+                }
+                _ => return Err(error),
+            }
+        }
+    };
+    let invalid = || "git の作業ツリーのフォルダを読み取れませんでした".to_owned();
+    let current = preflight_repo(&repo).await.ok_or_else(invalid)?;
+    if current.has_commit {
+        return Ok(current);
+    }
+
+    // An unborn repository may already have staged files. Commit through a separate,
+    // empty index so those files stay staged and the first commit contains no files.
+    let index = TempIndex::new();
+    let mut env = vec![index.env(), locale];
+    env.extend_from_slice(identity_env);
+    repo.run_with(&["read-tree", "--empty"], &env, 10).await?;
+    repo.run_with(
+        &[
+            "-c",
+            "user.useConfigOnly=true",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-m",
+            "Grok Build Desktop で初期化",
+        ],
+        &env,
+        TREE_SECS,
+    )
+    .await
+    .map_err(|error| {
+        if error.contains("no email was given")
+            || error.contains("no name was given")
+            || error.contains("unable to auto-detect email address")
+            || error.contains("empty ident name")
+        {
+            "Git の名前とメールアドレスを設定してください（git config --global user.name / git config --global user.email）".into()
+        } else {
+            error
+        }
+    })?;
+    preflight_repo(&repo).await.ok_or_else(invalid)
 }
 
 /// The working tree before a step, as a git tree object. It is also the recovery point:
@@ -386,6 +469,25 @@ pub struct Snapshot {
 /// Snapshots may hash many files, so they get more time than the quick queries.
 const TREE_SECS: u64 = 120;
 
+struct TempIndex(PathBuf);
+
+impl TempIndex {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("gbd-index-{}", uuid::Uuid::new_v4())))
+    }
+
+    fn env(&self) -> (&'static str, &OsStr) {
+        ("GIT_INDEX_FILE", self.0.as_os_str())
+    }
+}
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.0.with_extension("lock"));
+    }
+}
+
 /// Writes every file git does not ignore (tracked, changed and untracked) as a tree object.
 /// It works on a copy of the index, so the real index, the stash list and the files are left
 /// alone, and later edits to a file that was already untracked still show up in the diff.
@@ -395,7 +497,7 @@ const TREE_SECS: u64 = 120;
 /// of the real index is hashed again, so a file added with `--force` despite an ignore rule
 /// stays in. Entries outside a sparse checkout have no file to hash, so they are copied from
 /// the real index as they are, as the copy would have kept them.
-async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
+async fn worktree_index(repo: &Repo<'_>) -> Result<TempIndex, String> {
     let index = repo.run(&["rev-parse", "--git-path", "index"]).await?;
     let index = std::str::from_utf8(&index)
         .ok()
@@ -403,64 +505,68 @@ async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
         .filter(|index| !index.is_empty())
         .ok_or("git の index の場所を読み取れませんでした")?;
     let index = repo.dir.join(index);
-    let temp = std::env::temp_dir().join(format!("gbd-index-{}", uuid::Uuid::new_v4()));
-    let result = async {
-        let env = [("GIT_INDEX_FILE", temp.as_os_str())];
-        if !repo.filters_off.is_empty() {
-            let listed = repo
-                .run_at_top(&["ls-files", "-z", "-t", "-s"], &[], None, TREE_SECS)
-                .await?;
-            let tracked = split_tracked(&listed);
-            repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
-                .await?;
-            if !tracked.hash.is_empty() {
-                repo.run_at_top(
-                    // `--replace`: a file in `HEAD` may be a folder in the index, or the reverse.
-                    &[
-                        "update-index",
-                        "--add",
-                        "--remove",
-                        "--replace",
-                        "-z",
-                        "--stdin",
-                    ],
-                    &env,
-                    Some(&tracked.hash),
-                    TREE_SECS,
-                )
-                .await?;
-            }
-            if !tracked.keep.is_empty() {
-                repo.run_at_top(
-                    &["update-index", "-z", "--index-info"],
-                    &env,
-                    Some(&tracked.keep),
-                    TREE_SECS,
-                )
-                .await?;
-                repo.run_at_top(
-                    &["update-index", "--skip-worktree", "-z", "--stdin"],
-                    &env,
-                    Some(&tracked.keep_paths),
-                    TREE_SECS,
-                )
-                .await?;
-            }
-        } else if std::fs::copy(&index, &temp).is_err() {
-            repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
-                .await?;
+    let temp = TempIndex::new();
+    let env = [temp.env()];
+    if !repo.filters_off.is_empty() {
+        let listed = repo
+            .run_at_top(&["ls-files", "-z", "-t", "-s"], &[], None, TREE_SECS)
+            .await?;
+        let tracked = split_tracked(&listed);
+        repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
+            .await?;
+        if !tracked.hash.is_empty() {
+            repo.run_at_top(
+                // `--replace`: a file in `HEAD` may be a folder in the index, or the reverse.
+                &[
+                    "update-index",
+                    "--add",
+                    "--remove",
+                    "--replace",
+                    "-z",
+                    "--stdin",
+                ],
+                &env,
+                Some(&tracked.hash),
+                TREE_SECS,
+            )
+            .await?;
         }
-        repo.run_with(&["add", "-A"], &env, TREE_SECS).await?;
-        let tree = repo.run_with(&["write-tree"], &env, TREE_SECS).await?;
-        Ok(String::from_utf8_lossy(&tree).trim().to_owned())
+        if !tracked.keep.is_empty() {
+            repo.run_at_top(
+                &["update-index", "-z", "--index-info"],
+                &env,
+                Some(&tracked.keep),
+                TREE_SECS,
+            )
+            .await?;
+            repo.run_at_top(
+                &["update-index", "--skip-worktree", "-z", "--stdin"],
+                &env,
+                Some(&tracked.keep_paths),
+                TREE_SECS,
+            )
+            .await?;
+        }
+    } else if std::fs::copy(&index, &temp.0).is_err() {
+        repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
+            .await?;
     }
-    .await;
-    let _ = std::fs::remove_file(&temp);
-    let _ = std::fs::remove_file(temp.with_extension("lock"));
-    result
+    repo.run_with(&["add", "-A"], &env, TREE_SECS).await?;
+    Ok(temp)
 }
 
-/// The real index split for [`worktree_tree`], each list NUL-terminated as `update-index -z`
+async fn index_tree(repo: &Repo<'_>, index: &TempIndex) -> Result<String, String> {
+    let tree = repo
+        .run_with(&["write-tree"], &[index.env()], TREE_SECS)
+        .await?;
+    Ok(String::from_utf8_lossy(&tree).trim().to_owned())
+}
+
+async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
+    index_tree(repo, &worktree_index(repo).await?).await
+}
+
+/// The real index split for [`worktree_index`], each list NUL-terminated as `update-index -z`
 /// reads it.
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Tracked {
@@ -531,6 +637,159 @@ pub enum FileChange {
     Deleted,
     Renamed,
     Untracked,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct RestoreFile {
+    pub path: String,
+    pub change: FileChange,
+}
+
+pub fn recovery_command(tree: &str) -> String {
+    format!("git restore --source={tree} --worktree -- .")
+}
+
+pub async fn restore_preview(dir: &Path, tree: &str) -> Result<Vec<RestoreFile>, String> {
+    let repo = Repo::open(dir).await?;
+    preview_restore(&repo, tree).await
+}
+
+pub async fn restore(dir: &Path, tree: &str) -> Result<Vec<RestoreFile>, String> {
+    let repo = Repo::open(dir).await?;
+    let preview = preview_restore(&repo, tree).await?;
+    if !preview.is_empty() {
+        check_restore_paths(repo.dir, &preview)?;
+        // Overlay preserves files absent from the recovery tree, including staged additions.
+        repo.run_with(
+            &[
+                "restore",
+                &format!("--source={tree}"),
+                "--worktree",
+                "--overlay",
+                "--no-recurse-submodules",
+                "--",
+                ".",
+            ],
+            &[],
+            TREE_SECS,
+        )
+        .await?;
+    }
+    Ok(preview)
+}
+
+// Even overlay checkout may replace a file with a directory (or the reverse).
+// Refuse such collisions before Git can remove paths absent from the recovery tree.
+fn check_restore_paths(dir: &Path, files: &[RestoreFile]) -> Result<(), String> {
+    for file in files {
+        if matches!(restore_path(dir, &file.path)?, RestorePath::Collision) {
+            return Err(format!(
+                "ファイルとフォルダが競合しているため復元できません: {}",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+enum RestorePath {
+    Existing,
+    Missing,
+    Collision,
+}
+
+fn restore_path(dir: &Path, relative: &str) -> Result<RestorePath, String> {
+    let mut path = dir.to_path_buf();
+    let mut components = Path::new(relative).components().peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.is_dir() != components.peek().is_some() => {
+                return Ok(RestorePath::Collision);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RestorePath::Missing);
+            }
+            Err(error) => return Err(format!("復元先を確認できませんでした: {relative}: {error}")),
+        }
+    }
+    Ok(RestorePath::Existing)
+}
+
+async fn preview_restore(repo: &Repo<'_>, tree: &str) -> Result<Vec<RestoreFile>, String> {
+    if !matches!(tree.len(), 40 | 64)
+        || !tree
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || repo.text(&["cat-file", "-t", tree]).await.as_deref() != Some("tree")
+    {
+        return Err("作業前のツリーが見つかりません".into());
+    }
+    let index = worktree_index(repo).await?;
+    let preview = restore_diff(repo, tree, &index_tree(repo, &index).await?).await?;
+
+    // A file that was untracked at recovery time may now be ignored. Hash it
+    // explicitly if it still exists so the preview can compare its real contents.
+    let mut omitted = Vec::new();
+    for file in &preview {
+        if file.change == FileChange::Deleted
+            && matches!(restore_path(repo.dir, &file.path)?, RestorePath::Existing)
+        {
+            omitted.extend_from_slice(file.path.as_bytes());
+            omitted.push(0);
+        }
+    }
+    if omitted.is_empty() {
+        return Ok(preview);
+    }
+    repo.run_input(
+        &[
+            "--literal-pathspecs",
+            "add",
+            "--force",
+            "--sparse",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &[index.env()],
+        Some(&omitted),
+        TREE_SECS,
+    )
+    .await?;
+    restore_diff(repo, tree, &index_tree(repo, &index).await?).await
+}
+
+async fn restore_diff(
+    repo: &Repo<'_>,
+    tree: &str,
+    current: &str,
+) -> Result<Vec<RestoreFile>, String> {
+    let status = repo
+        .run_with(
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--relative",
+                "--name-status",
+                "--diff-filter=MDT",
+                "--ignore-submodules=all",
+                "-z",
+                tree,
+                current,
+                "--",
+                ".",
+            ],
+            &[],
+            TREE_SECS,
+        )
+        .await?;
+    Ok(parse_name_status(&status)
+        .into_iter()
+        .map(|(change, path)| RestoreFile { path, change })
+        .collect())
 }
 
 const DIFF_ARGS: [&str; 6] = [
@@ -741,6 +1000,177 @@ mod tests {
             .await
             .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn restore_rewrites_only_recovery_paths_in_the_project() {
+        let repo = repository().await.unwrap();
+        let sub = repo.0.join("project");
+        fs::create_dir(&sub).unwrap();
+        for path in ["project/modified.txt", "project/deleted.txt", "outside.txt"] {
+            fs::write(repo.0.join(path), "original\n").unwrap();
+        }
+        commit(&repo.0).await;
+        let tree = snapshot(&sub).await.unwrap().base.unwrap();
+        fs::write(sub.join("modified.txt"), "edited\n").unwrap();
+        fs::remove_file(sub.join("deleted.txt")).unwrap();
+        fs::write(sub.join("new.txt"), "untracked\n").unwrap();
+        fs::write(sub.join("staged.txt"), "staged\n").unwrap();
+        assert!(git(&repo.0, &["add", "project/staged.txt"]).await.is_some());
+        fs::write(repo.0.join("outside.txt"), "outside edit\n").unwrap();
+
+        let index_path = repo.0.join(".git/index");
+        let index = fs::read(&index_path).unwrap();
+        let expected = [
+            RestoreFile {
+                path: "deleted.txt".into(),
+                change: FileChange::Deleted,
+            },
+            RestoreFile {
+                path: "modified.txt".into(),
+                change: FileChange::Modified,
+            },
+        ];
+        assert_eq!(restore_preview(&sub, &tree).await.unwrap(), expected);
+        assert_eq!(fs::read(&index_path).unwrap(), index);
+        assert!(!sub.join("deleted.txt").exists());
+
+        assert_eq!(restore(&sub, &tree).await.unwrap(), expected);
+        for path in ["modified.txt", "deleted.txt"] {
+            let text = fs::read_to_string(sub.join(path)).unwrap();
+            assert_eq!(text.trim_end(), "original");
+        }
+        assert_eq!(
+            fs::read_to_string(sub.join("new.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert_eq!(
+            fs::read_to_string(sub.join("staged.txt")).unwrap(),
+            "staged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.0.join("outside.txt")).unwrap(),
+            "outside edit\n"
+        );
+        assert_eq!(fs::read(&index_path).unwrap(), index);
+        assert!(restore_preview(&sub, &tree).await.unwrap().is_empty());
+
+        let commit = text(&repo.0, &["rev-parse", "HEAD"]).await.unwrap();
+        assert!(restore_preview(&sub, &commit).await.is_err());
+        assert!(restore(&sub, "HEAD").await.is_err());
+        assert!(restore(&sub, &tree.to_uppercase()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_preview_compares_recovery_paths_that_became_ignored() {
+        let repo = repository().await.unwrap();
+        let sub = repo.0.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join(".gitignore"), "").unwrap();
+        commit(&repo.0).await;
+        fs::write(sub.join("same.txt"), "original").unwrap();
+        fs::write(sub.join("[changed].txt"), "original").unwrap();
+        let tree = snapshot(&sub).await.unwrap().base.unwrap();
+        fs::write(sub.join(".gitignore"), "*.txt\n").unwrap();
+        fs::write(sub.join("[changed].txt"), "edited").unwrap();
+
+        assert_eq!(
+            restore_preview(&sub, &tree).await.unwrap(),
+            [
+                RestoreFile {
+                    path: ".gitignore".into(),
+                    change: FileChange::Modified
+                },
+                RestoreFile {
+                    path: "[changed].txt".into(),
+                    change: FileChange::Modified
+                },
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_to_remove_files_in_a_colliding_directory() {
+        let repo = repository().await.unwrap();
+        let path = repo.0.join("tracked.txt");
+        fs::write(&path, "original").unwrap();
+        commit(&repo.0).await;
+        let tree = snapshot(&repo.0).await.unwrap().base.unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("new.txt"), "keep").unwrap();
+        let preview = restore_preview(&repo.0, &tree).await.unwrap();
+        assert_eq!(
+            preview,
+            [RestoreFile {
+                path: "tracked.txt".into(),
+                change: FileChange::Deleted
+            }]
+        );
+        assert!(restore(&repo.0, &tree).await.is_err());
+        assert_eq!(fs::read_to_string(path.join("new.txt")).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn init_plain_folder_leaves_files_untracked() {
+        let dir =
+            Repository(std::env::temp_dir().join(format!("gbd-git-{}", uuid::Uuid::new_v4())));
+        fs::create_dir(&dir.0).unwrap();
+        fs::write(dir.0.join("existing.txt"), "untracked").unwrap();
+        let env = [
+            ("GIT_AUTHOR_NAME", OsStr::new("test")),
+            ("GIT_AUTHOR_EMAIL", OsStr::new("t@example.invalid")),
+            ("GIT_COMMITTER_NAME", OsStr::new("test")),
+            ("GIT_COMMITTER_EMAIL", OsStr::new("t@example.invalid")),
+        ];
+        let state = init_with(&dir.0, &env).await.unwrap();
+        assert!(state.is_git && state.has_commit && state.branch.is_some());
+        assert_eq!(
+            text(&dir.0, &["ls-tree", "-r", "HEAD"]).await.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            text(&dir.0, &["ls-files", "--others", "--exclude-standard"])
+                .await
+                .as_deref(),
+            Some("existing.txt")
+        );
+        assert!(init(&dir.0.join("existing.txt")).await.is_err());
+        assert!(init(&dir.0.join("missing")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn init_unborn_repo_commits_only_an_empty_tree_and_keeps_head_on_retry() {
+        let repo = repository().await.unwrap();
+        fs::write(repo.0.join("staged.txt"), "staged").unwrap();
+        assert!(git(&repo.0, &["add", "staged.txt"]).await.is_some());
+        let sub = repo.0.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let state = init(&sub).await.unwrap();
+        assert!(state.is_git && state.has_commit);
+        assert_eq!(
+            text(&repo.0, &["rev-list", "--count", "HEAD"])
+                .await
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            text(&repo.0, &["ls-tree", "-r", "HEAD"]).await.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            text(&repo.0, &["diff", "--cached", "--name-only"])
+                .await
+                .as_deref(),
+            Some("staged.txt")
+        );
+        let head = text(&repo.0, &["rev-parse", "HEAD"]).await.unwrap();
+        assert!(init(&repo.0).await.unwrap().has_commit);
+        assert_eq!(
+            text(&repo.0, &["rev-parse", "HEAD"]).await.as_deref(),
+            Some(head.as_str())
+        );
+        assert!(!sub.join(".git").exists());
     }
 
     #[tokio::test]

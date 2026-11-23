@@ -2,14 +2,12 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { MarkdownBody } from "./MarkdownBody";
 import { AgentSettings } from "./AgentSettings";
 import { GatewaySettings } from "./GatewaySettings";
-import { LogDrawer, StatusBadge, TaskTimeline, type LogTarget } from "./OrchestraView";
+import { LogDrawer, StatusBadge, TaskTimeline, type LogTarget, type LogView } from "./OrchestraView";
 import {
   type GatewayView,
   type HubSnapshot,
@@ -17,8 +15,8 @@ import {
   type OrchestraAction,
   type OrchestraState,
   type Registry,
-  type Submitted,
   type TaskRecord,
+  FILE_CHANGE_MARK,
   REJECTION_LABEL,
   RUN_STATUS_LABEL,
   SOURCE_LABEL,
@@ -33,6 +31,7 @@ import {
   queuedRuns,
   reduceOrchestra,
   runBadge,
+  runFinished,
   sameProject,
   taskActive,
   taskBadge,
@@ -42,7 +41,7 @@ import "./App.css";
 const LAST_KEY = "gbd-last-folder";
 const CONTEXT_KEY = "gbd-context-open";
 const MOTION_KEY = "gbd-motion";
-const FLOW_AGENT_KEY = "gbd-flow-agent";
+const LOG_VIEW_KEY = "gbd-log-view";
 
 type SettingsPage = "display" | "agents" | "gateway" | "app";
 
@@ -59,9 +58,26 @@ interface Preflight {
   branch?: string | null;
 }
 
+interface RestoreFile {
+  path: string;
+  change: string;
+}
+
+interface PendingRestore {
+  jobId: string;
+  project: string;
+  files: RestoreFile[];
+  /** The files changed after the first preview, so the user confirms the new list. */
+  changed?: boolean;
+}
+
 function errorText(error: unknown) {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string") return error;
+  // Hub commands reject with { code, message }.
+  if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
+    return (error as { message: string }).message;
+  }
   return String(error);
 }
 
@@ -106,8 +122,8 @@ function baseName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
 
-function showsMarkdown(text: string) {
-  return /```|\*\*|__|`[^`\n]+`|^\s{0,3}#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|\[[^\]]+\]\([^)]+\)/m.test(text);
+function readLogView(): LogView {
+  return localStorage.getItem(LOG_VIEW_KEY) === "raw" ? "raw" : "brief";
 }
 
 export default function App() {
@@ -118,42 +134,38 @@ export default function App() {
     const last = localStorage.getItem(LAST_KEY);
     return last ? [last] : [];
   });
-  const [draft, setDraft] = useState("");
-  const [found, setFound] = useState<{ project: string; query: string; paths: string[] } | null>(null);
   const [filter, setFilter] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(() => localStorage.getItem(CONTEXT_KEY) !== "0");
   const [motion, setMotion] = useState(() => localStorage.getItem(MOTION_KEY) !== "0");
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("display");
-  const [dragOver, setDragOver] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [updateNote, setUpdateNote] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
   const [hasUpdate, setHasUpdate] = useState(false);
   const [pendingApply, setPendingApply] = useState(false);
-  const [flowAgent, setFlowAgent] = useState(() => localStorage.getItem(FLOW_AGENT_KEY) ?? "");
   const [orch, setOrch] = useState<OrchestraState>(initialOrchestra);
   const [registry, setRegistry] = useState<Registry | null>(null);
   const [logTarget, setLogTarget] = useState<LogTarget | null>(null);
+  const [logView, setLogView] = useState<LogView>(readLogView);
   const [pendingTaskDelete, setPendingTaskDelete] = useState<string | null>(null);
+  const [pendingRestore, setPendingRestore] = useState<PendingRestore | null>(null);
+  const [pendingInit, setPendingInit] = useState<string | null>(null);
   const [openTasks, setOpenTasks] = useState<string[]>([]);
   const [hubBusy, setHubBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [preflight, setPreflight] = useState<{ project: string; result: Preflight } | null>(null);
   const [preflightTick, setPreflightTick] = useState(0);
-  const flowSendingRef = useRef(false);
   const folderRef = useRef(folder);
   folderRef.current = folder;
   const orchRef = useRef(orch);
   orchRef.current = orch;
   const pushOrchRef = useRef<(event: Record<string, unknown> | OrchestraAction) => void>(() => {});
   const transcriptRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
-  const sheetRef = useRef<HTMLDivElement>(null);
-  const pathDropAt = useRef(0);
   const updateRef = useRef<Update | null>(null);
-  const takePathsRef = useRef<(paths: string[]) => void>(() => {});
 
   useEffect(() => {
     let frame = 0;
@@ -215,9 +227,15 @@ export default function App() {
       if (fetching.has(taskId)) stale.add(taskId);
       else if (!known.has(taskId) && !orchRef.current.tasks[taskId]) fetchTask(taskId);
     });
-    const stopLogs = listen<{ nodeId?: string; lines?: LogLine[] }>("agent://log", (event) => {
-      const { nodeId, lines } = event.payload;
-      if (typeof nodeId === "string" && Array.isArray(lines)) push({ type: "log-batch", nodeId, lines });
+    const stopLogs = listen<{ nodeId?: string; lines?: LogLine[]; brief?: LogLine[] }>("agent://log", (event) => {
+      const { nodeId, lines, brief } = event.payload;
+      if (typeof nodeId !== "string") return;
+      push({
+        type: "log-batch",
+        nodeId,
+        lines: Array.isArray(lines) ? lines : [],
+        brief: Array.isArray(brief) ? brief : [],
+      });
     });
     const requestedAt = nextStamp();
     void invoke<HubSnapshot>("orchestrator_snapshot")
@@ -301,45 +319,6 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [settingsOpen]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    function pointInSheet(position: { x: number; y: number }) {
-      const sheet = sheetRef.current;
-      if (!sheet) return false;
-      const ratio = window.devicePixelRatio || 1;
-      const x = position.x / ratio;
-      const y = position.y / ratio;
-      const rect = sheet.getBoundingClientRect();
-      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-    }
-    void getCurrentWebview()
-      .onDragDropEvent((event) => {
-        const payload = event.payload;
-        if (payload.type === "leave") {
-          setDragOver(false);
-          return;
-        }
-        if (payload.type === "enter" || payload.type === "over") {
-          setDragOver(pointInSheet(payload.position));
-          return;
-        }
-        setDragOver(false);
-        if (!pointInSheet(payload.position) || payload.paths.length === 0) return;
-        pathDropAt.current = Date.now();
-        takePathsRef.current(payload.paths);
-      })
-      .then((stop) => {
-        if (cancelled) stop();
-        else unlisten = stop;
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
-
   // A folder made into a repository outside the app is noticed when the window comes back.
   useEffect(() => {
     const onFocus = () => setPreflightTick((tick) => tick + 1);
@@ -348,17 +327,22 @@ export default function App() {
   }, []);
 
   const viewTask = orch.activeTaskId ? orch.tasks[orch.activeTaskId] ?? null : null;
-  const flowProject = viewTask?.project ?? folder;
+  const viewProject = viewTask?.project ?? folder;
+  // A job of the shown folder can make the first commit or change the branch, so the check reruns.
+  const projectRuns = useMemo(
+    () => (viewProject ? projectTasks(orch.tasks, viewProject).reduce((sum, task) => sum + task.runs.length, 0) : 0),
+    [orch.tasks, viewProject],
+  );
 
   useEffect(() => {
-    if (!flowProject) {
+    if (!viewProject) {
       setPreflight(null);
       return;
     }
     let cancelled = false;
-    void invoke<Preflight>("orchestrator_preflight", { project: flowProject })
+    void invoke<Preflight>("orchestrator_preflight", { project: viewProject })
       .then((result) => {
-        if (!cancelled) setPreflight({ project: flowProject, result });
+        if (!cancelled) setPreflight({ project: viewProject, result });
       })
       .catch(() => {
         if (!cancelled) setPreflight(null);
@@ -366,7 +350,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [flowProject, preflightTick, viewTask?.runs.length]);
+  }, [viewProject, preflightTick, projectRuns]);
 
   useEffect(() => {
     const box = transcriptRef.current;
@@ -374,47 +358,10 @@ export default function App() {
     box.scrollTop = box.scrollHeight;
   }, [viewTask]);
 
-  useEffect(() => {
-    const field = inputRef.current;
-    if (!field) return;
-    field.style.height = "0px";
-    field.style.height = `${Math.min(180, Math.max(48, field.scrollHeight))}px`;
-  }, [draft]);
-
-  const atMatch = draft.match(/(^|\s)@([^\s@]*)$/);
-  const atQuery = atMatch?.[2] ?? null;
-
-  // Each answer remembers the folder and the word it was for, so a list from another folder or
-  // an older word is never shown or inserted.
-  const suggestions =
-    found && atQuery !== null && found.query === atQuery && sameProject(found.project, flowProject) ? found.paths : [];
-
-  useEffect(() => {
-    if (atQuery === null || !flowProject) {
-      setFound(null);
-      return;
-    }
-    let cancelled = false;
-    const project = flowProject;
-    const query = atQuery;
-    const timer = window.setTimeout(() => {
-      void invoke<string[]>("search_files", { query, project })
-        .then((paths) => {
-          if (!cancelled) setFound({ project, query, paths });
-        })
-        .catch(() => {
-          if (!cancelled) setFound(null);
-        });
-    }, 120);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [atQuery, flowProject]);
-
   function chooseFolder(path: string) {
     if (!sameProject(path, folder)) {
       setError("");
+      setNotice("");
       setLogTarget(null);
       setOrch((current) => (current.activeTaskId ? reduceOrchestra(current, { type: "select", id: null }) : current));
     }
@@ -444,65 +391,9 @@ export default function App() {
     }
   }
 
-  function insertDraftPaths(paths: string[]) {
-    if (paths.length === 0) return;
-    const block = paths.join("\n");
-    const field = inputRef.current;
-    setDraft((current) => {
-      const start = field?.selectionStart ?? current.length;
-      const end = field?.selectionEnd ?? start;
-      const next = `${current.slice(0, start)}${block}${current.slice(end)}`;
-      const caret = start + block.length;
-      window.requestAnimationFrame(() => {
-        const node = inputRef.current;
-        if (!node || node.disabled) return;
-        node.focus();
-        node.setSelectionRange(caret, caret);
-      });
-      return next;
-    });
-  }
-
-  takePathsRef.current = insertDraftPaths;
-
   const flowError = useCallback((failure: unknown) => {
     setError(errorText(failure));
   }, []);
-
-  async function send() {
-    const text = draft.trim();
-    const project = flowProject;
-    if (!text || !project || !composeReady || flowSendingRef.current) return;
-    flowSendingRef.current = true;
-    const sentDraft = draft;
-    const sentTask = viewTask?.id ?? null;
-    const sentFolder = folder;
-    try {
-      const submitted = await invoke<Submitted>("orchestrator_dispatch", {
-        project,
-        agentId: flowAgent,
-        prompt: text,
-        taskId: viewTask?.id,
-      });
-      setOpenTasks((current) => (current.includes(submitted.taskId) ? current : [...current, submitted.taskId]));
-      // Another task or folder opened while waiting keeps the screen and the draft written there.
-      if (orchRef.current.activeTaskId !== sentTask || folderRef.current !== sentFolder) return;
-      stickRef.current = true;
-      setDraft((current) => (current === sentDraft ? "" : current));
-      setFound(null);
-      setError("");
-      setOrch((current) => reduceOrchestra(current, { type: "select", id: submitted.taskId }));
-    } catch (failure) {
-      flowError(failure);
-    } finally {
-      flowSendingRef.current = false;
-    }
-  }
-
-  function chooseFlowAgent(id: string) {
-    setFlowAgent(id);
-    localStorage.setItem(FLOW_AGENT_KEY, id);
-  }
 
   async function hubCall(command: string, args?: Record<string, unknown>) {
     setHubBusy(true);
@@ -540,6 +431,72 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Shows which files going back would overwrite before anything is touched. */
+  const askRestore = useCallback(
+    (jobId: string, project: string) => {
+      setNotice("");
+      void invoke<{ files: RestoreFile[] }>("orchestrator_restore_preview", { jobId })
+        .then((result) => setPendingRestore({ jobId, project, files: result.files ?? [] }))
+        .catch(flowError);
+    },
+    [flowError],
+  );
+
+  async function confirmRestore() {
+    const pending = pendingRestore;
+    setPendingRestore(null);
+    if (!pending) return;
+    setHubBusy(true);
+    try {
+      // A job may have changed the folder while the dialog was open; the list is shown again then.
+      const latest = await invoke<{ files: RestoreFile[] }>("orchestrator_restore_preview", { jobId: pending.jobId });
+      const fresh = latest.files ?? [];
+      const key = (files: RestoreFile[]) => files.map((file) => `${file.change}:${file.path}`).sort().join("\n");
+      if (key(fresh) !== key(pending.files)) {
+        setPendingRestore({ ...pending, files: fresh, changed: true });
+        return;
+      }
+      const result = await invoke<{ files: RestoreFile[] }>("orchestrator_restore", { jobId: pending.jobId });
+      const count = result.files?.length ?? 0;
+      setError("");
+      setNotice(count ? `作業前の状態に ${count} 件のファイルを戻しました` : "戻すファイルはありませんでした");
+    } catch (failure) {
+      flowError(failure);
+    } finally {
+      setHubBusy(false);
+    }
+  }
+
+  async function confirmInit() {
+    const project = pendingInit;
+    setPendingInit(null);
+    if (!project) return;
+    setHubBusy(true);
+    try {
+      await invoke<Preflight>("orchestrator_git_init", { project });
+      // Asking again drops any check that started before the init and would answer late.
+      setPreflightTick((tick) => tick + 1);
+      setError("");
+      setNotice(`${baseName(project)} でジョブを受けられるようにしました`);
+    } catch (failure) {
+      flowError(failure);
+    } finally {
+      setHubBusy(false);
+    }
+  }
+
+  /** Kept apart from hubBusy, so a restore or an init in another folder never blocks the stop. */
+  async function stopAll() {
+    setStopping(true);
+    try {
+      await invoke("orchestrator_stop_all");
+    } catch (failure) {
+      flowError(failure);
+    } finally {
+      setStopping(false);
+    }
+  }
+
   async function toggleAccepting(accepting: boolean) {
     setHubBusy(true);
     try {
@@ -561,7 +518,7 @@ export default function App() {
     await hubCall("orchestrator_resume_project", { project });
   }
 
-  /** Opening a task moves the folder selection with it, so the left pane and the target agree. */
+  /** Opening a task moves the folder selection with it, so the left pane and the task agree. */
   function selectTask(id: string | null) {
     if (id !== orch.activeTaskId) setLogTarget(null);
     stickRef.current = true;
@@ -576,6 +533,7 @@ export default function App() {
       );
     }
     setError("");
+    setNotice("");
     setOrch((current) => reduceOrchestra(current, { type: "select", id }));
   }
 
@@ -586,8 +544,20 @@ export default function App() {
   const openLog = useCallback((target: LogTarget) => {
     setLogTarget(target);
     void invoke<LogLine[]>("agent_log", { nodeId: target.nodeId })
-      .then((lines) => setOrch((current) => reduceOrchestra(current, { type: "logs-loaded", nodeId: target.nodeId, lines })))
+      .then((lines) =>
+        setOrch((current) => reduceOrchestra(current, { type: "logs-loaded", nodeId: target.nodeId, lines, kind: "raw" })),
+      )
       .catch(() => {});
+    void invoke<LogLine[]>("agent_brief", { nodeId: target.nodeId })
+      .then((lines) =>
+        setOrch((current) => reduceOrchestra(current, { type: "logs-loaded", nodeId: target.nodeId, lines, kind: "brief" })),
+      )
+      .catch(() => {});
+  }, []);
+
+  const chooseLogView = useCallback((view: LogView) => {
+    setLogView(view);
+    localStorage.setItem(LOG_VIEW_KEY, view);
   }, []);
 
   function deleteTask(id: string) {
@@ -599,26 +569,6 @@ export default function App() {
         pushOrchRef.current({ type: "task-removed", id });
       })
       .catch(flowError);
-  }
-
-  function startTask() {
-    selectTask(null);
-    inputRef.current?.focus();
-  }
-
-  function attach(path: string) {
-    setDraft((current) => current.replace(/(^|\s)@[^\s@]*$/, `$1${path} `));
-    setFound(null);
-    inputRef.current?.focus();
-  }
-
-  function insertAt() {
-    setDraft((current) => {
-      if (/(^|\s)@$/.test(current)) return current;
-      const gap = current.length === 0 || /\s$/.test(current) ? "" : " ";
-      return `${current}${gap}@`;
-    });
-    inputRef.current?.focus();
   }
 
   const closeLog = useCallback(() => setLogTarget(null), []);
@@ -673,38 +623,22 @@ export default function App() {
   const live = useMemo(() => liveRun(orchTasks), [orchTasks]);
   const waiting = useMemo(() => queuedRuns(orchTasks).length, [orchTasks]);
   const agents = useMemo(() => registry?.agents ?? [], [registry]);
-  const flowAgents = agents.filter((agent) => agent.enabled);
-  const flowAgentReady = flowAgents.some((agent) => agent.id === flowAgent);
-
-  // With no remembered agent, the first enabled one is chosen so the field is not left empty.
-  useEffect(() => {
-    if (!flowAgentReady && flowAgents.length > 0) chooseFlowAgent(flowAgents[0].id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flowAgentReady, flowAgents.length]);
   const gateway = orch.gateway;
   const pipeFailed = gateway.status?.state === "failed";
-  const projectAllowed = Boolean(flowProject) && allowed.some((path) => sameProject(path, flowProject));
+  const projectAllowed = Boolean(viewProject) && allowed.some((path) => sameProject(path, viewProject));
   const gatewayValue = pipeFailed ? "failed" : gateway.accepting ? "on" : "off";
-  const check_ = preflight && sameProject(preflight.project, flowProject) ? preflight.result : null;
-  const repoProblem = !check_ ? "" : !check_.isGit ? "git のリポジトリではありません" : !check_.hasCommit ? "コミットがありません" : "";
+  const repo = preflight && sameProject(preflight.project, viewProject) ? preflight.result : null;
+  const repoProblem = !repo ? "" : !repo.isGit ? "git のリポジトリではありません" : !repo.hasCommit ? "コミットがありません" : "";
   const needle = filter.trim().toLowerCase();
-  const composeReady =
-    Boolean(flowProject) && Boolean(check_) && !repoProblem && flowAgentReady && (!viewTask || viewTask.status === "open");
-  const placeholder = !flowProject
-    ? "プロジェクトを選択"
-    : repoProblem
-      ? repoProblem
-      : !flowAgentReady
-        ? "エージェントを選択"
-        : viewTask?.status === "paused"
-          ? "一時停止中"
-          : viewTask?.status === "closed"
-            ? "終了したタスク"
-            : viewTask
-              ? "続きの依頼"
-              : "依頼";
   const openTitle = viewTask ? viewTask.title || "無題" : folder ? baseName(folder) : "";
-  const projectRejections = gateway.rejections.filter((item) => flowProject && sameProject(item.project, flowProject));
+  const projectRejections = gateway.rejections.filter((item) => viewProject && sameProject(item.project, viewProject));
+  // Going back is refused while a job of the same folder runs or waits, since it would race the job.
+  const projectBusy = (project: string) =>
+    Object.values(orchTasks).some(
+      (task) => sameProject(task.project, project) && task.runs.some((run) => !runFinished(run.status)),
+    );
+  const restoreBlocked = projectBusy(viewProject);
+  const busyAnywhere = Boolean(live) || waiting > 0;
 
   return (
     <div className={`desk${contextOpen ? "" : " context-shut"}${motion ? " motion" : ""}`}>
@@ -713,10 +647,6 @@ export default function App() {
           <SearchIcon />
           <input value={filter} placeholder="検索" aria-label="検索" onChange={(event) => setFilter(event.target.value)} />
         </label>
-        <button className="new-chat" type="button" disabled={!folder} onClick={startTask}>
-          <TaskIcon />
-          新規タスク
-        </button>
         <button className="new-chat" type="button" onClick={() => void addProject()}>
           <FolderIcon />
           新規プロジェクト
@@ -857,37 +787,17 @@ export default function App() {
       </header>
 
       <main className="stage">
-        <div
-          className="sheet"
-          ref={sheetRef}
-          onDragOver={(event) => {
-            if (![...event.dataTransfer.types].includes("Files")) return;
-            event.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={(event) => {
-            const next = event.relatedTarget;
-            if (next instanceof Node && event.currentTarget.contains(next)) return;
-            setDragOver(false);
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            setDragOver(false);
-            const dropped = [...event.dataTransfer.files];
-            window.setTimeout(() => {
-              if (Date.now() - pathDropAt.current < 1000) return;
-              insertDraftPaths(
-                dropped
-                  .map((file) => (file as File & { path?: string }).path)
-                  .filter((path): path is string => typeof path === "string" && path.length > 0),
-              );
-            }, 300);
-          }}
-        >
+        <div className="sheet">
           {error && (
             <p className="banner warn">
               {error}
               <button type="button" onClick={() => setError("")}>閉じる</button>
+            </p>
+          )}
+          {notice && (
+            <p className="banner">
+              {notice}
+              <button type="button" onClick={() => setNotice("")}>閉じる</button>
             </p>
           )}
 
@@ -905,91 +815,36 @@ export default function App() {
                   task={viewTask}
                   agents={agents}
                   busy={hubBusy}
+                  restoreBlocked={restoreBlocked || hubBusy}
                   onResume={resumeTask}
                   onClose={closeTask}
                   onOpenLog={openLog}
                   onCancel={cancelJob}
                   onKill={killJob}
+                  onRestore={askRestore}
                 />
               )}
             </div>
             {!folder && !viewTask && (
               <div className="welcome">
-                <p className="welcome-prompt">どのプロジェクトで作業しますか？</p>
-                <ProjectPicker
-                  folder={folder}
-                  folders={projects}
-                  onChoose={chooseFolder}
-                  onBrowse={() => void addProject()}
-                />
+                <p className="welcome-prompt">どのプロジェクトを見ますか？</p>
+                <ProjectPicker folder={folder} folders={projects} onChoose={chooseFolder} onBrowse={() => void addProject()} />
               </div>
             )}
           </div>
 
-          {logTarget && <LogDrawer target={logTarget} lines={orch.logs[logTarget.nodeId] ?? []} onClose={closeLog} />}
+          {logTarget && (
+            <LogDrawer
+              target={logTarget}
+              lines={(logView === "brief" ? orch.briefs : orch.logs)[logTarget.nodeId] ?? []}
+              view={logView}
+              onView={chooseLogView}
+              onClose={closeLog}
+            />
+          )}
 
           <div className="composer-dock">
-            <form
-              className={dragOver ? "composer drag" : "composer"}
-              onSubmit={(event) => {
-                event.preventDefault();
-                void send();
-              }}
-            >
-              {suggestions.length > 0 && (
-                <ul className="suggest">
-                  {suggestions.map((path) => (
-                    <li key={path}>
-                      <button type="button" onClick={() => attach(path)}>{path}</button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {showsMarkdown(draft) && (
-                <div className="composer-preview bubble assistant">
-                  <MarkdownBody text={draft} live />
-                </div>
-              )}
-              <textarea
-                ref={inputRef}
-                value={draft}
-                placeholder={placeholder}
-                disabled={!composeReady}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    if (suggestions.length > 0 && atQuery !== null) {
-                      attach(suggestions[0]);
-                      return;
-                    }
-                    void send();
-                  }
-                }}
-              />
-              <div className="composer-bar">
-                <button type="button" className="orb ghost" aria-label="パスを入力" disabled={!composeReady} onClick={insertAt}>
-                  <PlusIcon />
-                </button>
-                <span className="composer-spacer" />
-                {(live || waiting > 0) && (
-                  <button
-                    type="button"
-                    className="loop-stop"
-                    disabled={hubBusy}
-                    title="実行中のジョブを止め、待ちを取り消し、Grok Bot の受付を止めます"
-                    onClick={() => void hubCall("orchestrator_stop_all")}
-                  >
-                    <span className="stop-mark" aria-hidden="true" />
-                    緊急停止
-                  </button>
-                )}
-                <button className="orb send" type="submit" aria-label="送信" disabled={!composeReady || !draft.trim()}>
-                  <SendIcon />
-                </button>
-              </div>
-            </form>
-            <div className="composer-meta">
+            <div className="status-bar">
               <div className="meta-left">
                 <QuietSelect
                   label="Grok Bot"
@@ -1000,7 +855,7 @@ export default function App() {
                     pipeFailed
                       ? [{ value: "failed", label: "パイプ失敗" }]
                       : [
-                          { value: "on", label: flowProject && !projectAllowed ? "受付中（未許可）" : "受付中" },
+                          { value: "on", label: viewProject && !projectAllowed ? "受付中（未許可）" : "受付中" },
                           { value: "off", label: "受付停止" },
                         ]
                   }
@@ -1020,21 +875,22 @@ export default function App() {
                   </button>
                 )}
               </div>
-              <div className="meta-configs">
-                {viewTask && (
-                  <span className="flow-turns" title="このタスクのジョブの数と上限">
-                    {viewTask.dispatches} / {viewTask.dispatchLimit}
-                  </span>
-                )}
-                <QuietSelect
-                  label="エージェント"
-                  value={flowAgentReady ? flowAgent : ""}
-                  align="right"
-                  disabled={flowAgents.length === 0}
-                  choices={flowAgents.map((agent) => ({ value: agent.id, label: agent.name || agent.id }))}
-                  onChange={chooseFlowAgent}
-                />
-              </div>
+              <span className="composer-spacer" />
+              {viewTask && (
+                <span className="flow-turns" title="このタスクのジョブの数と上限">
+                  {viewTask.dispatches} / {viewTask.dispatchLimit}
+                </span>
+              )}
+              <button
+                type="button"
+                className="loop-stop"
+                disabled={stopping || !busyAnywhere}
+                title="実行中のジョブを止め、待ちを取り消し、Grok Bot の受付を止めます"
+                onClick={() => void stopAll()}
+              >
+                <span className="stop-mark" aria-hidden="true" />
+                緊急停止
+              </button>
             </div>
           </div>
         </div>
@@ -1045,16 +901,14 @@ export default function App() {
           <section className="side-card">
             <div className="side-head">
               <h2>プロジェクト</h2>
-              <strong title={flowProject}>{flowProject ? baseName(flowProject) : "—"}</strong>
+              <strong title={viewProject}>{viewProject ? baseName(viewProject) : "—"}</strong>
             </div>
-            {flowProject && (
+            {viewProject && (
               <dl>
-                <div><dt>パス</dt><dd title={flowProject}>{flowProject}</dd></div>
+                <div><dt>パス</dt><dd title={viewProject}>{viewProject}</dd></div>
                 <div>
                   <dt>git</dt>
-                  <dd className={repoProblem ? "warn" : ""}>
-                    {!check_ ? "確認中" : repoProblem || check_.branch || "ブランチなし"}
-                  </dd>
+                  <dd className={repoProblem ? "warn" : ""}>{!repo ? "確認中" : repoProblem || repo.branch || "ブランチなし"}</dd>
                 </div>
                 <div><dt>Grok Bot</dt><dd className={projectAllowed ? "" : "warn"}>{projectAllowed ? "許可" : "未許可"}</dd></div>
                 <div>
@@ -1063,7 +917,12 @@ export default function App() {
                 </div>
               </dl>
             )}
-            {flowProject && !projectAllowed && (
+            {viewProject && repoProblem && (
+              <button className="pill" type="button" disabled={hubBusy} onClick={() => setPendingInit(viewProject)}>
+                {repo && !repo.isGit ? "git を初期化" : "最初のコミットを作る"}
+              </button>
+            )}
+            {viewProject && !projectAllowed && (
               <button
                 className="pill"
                 type="button"
@@ -1162,7 +1021,12 @@ export default function App() {
                 )}
                 {settingsPage === "agents" && <AgentSettings registry={registry} onChange={setRegistry} />}
                 {settingsPage === "gateway" && (
-                  <GatewaySettings folders={projects} live={gateway} onSaved={(view) => setAllowed(view.allowedProjects)} />
+                  <GatewaySettings
+                    folders={projects}
+                    live={gateway}
+                    agents={agents}
+                    onSaved={(view) => setAllowed(view.allowedProjects)}
+                  />
                 )}
                 {settingsPage === "app" && (
                   <>
@@ -1197,6 +1061,66 @@ export default function App() {
               <button type="button" onClick={() => setPendingTaskDelete(null)}>やめる</button>
               <button className="solid danger" type="button" onClick={() => deleteTask(pendingTaskDelete)}>
                 削除する
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingRestore && (
+        <div className="modal">
+          <section>
+            <h3>作業前の状態に戻しますか</h3>
+            {pendingRestore.files.length === 0 ? (
+              <p>{baseName(pendingRestore.project)} で戻すファイルはありません。</p>
+            ) : (
+              <>
+                {pendingRestore.changed && <p className="warn-text">確認のあいだにファイルが変わりました。いまの一覧で確かめてください。</p>}
+                <p>
+                  {baseName(pendingRestore.project)} の {pendingRestore.files.length} 件のファイルを、このジョブの前の内容で上書きします。
+                  いまの内容は失われます。あとから作られたファイルは消しません。
+                </p>
+                <ul className="restore-files">
+                  {pendingRestore.files.map((file) => {
+                    const change = FILE_CHANGE_MARK[file.change as keyof typeof FILE_CHANGE_MARK];
+                    return (
+                      <li key={file.path}>
+                        <span className="file-mark" title={change?.label ?? file.change}>{change?.mark ?? "?"}</span>
+                        <span className="file-path">{file.path}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
+            )}
+            <div className="modal-actions">
+              <button type="button" onClick={() => setPendingRestore(null)}>やめる</button>
+              {pendingRestore.files.length > 0 && (
+                <button
+                  className="solid danger"
+                  type="button"
+                  disabled={hubBusy || projectBusy(pendingRestore.project)}
+                  title={projectBusy(pendingRestore.project) ? "このプロジェクトでジョブが動いているあいだは戻せません" : undefined}
+                  onClick={() => void confirmRestore()}
+                >
+                  戻す
+                </button>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingInit && (
+        <div className="modal">
+          <section>
+            <h3>{baseName(pendingInit)} でジョブを受けられるようにしますか</h3>
+            <p>
+              git のリポジトリでなければ作り、空の最初のコミットを作ります。ファイルはコミットしません。
+              ジョブはコミットがあるリポジトリでしか動かないため、その前提だけを満たします。
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setPendingInit(null)}>やめる</button>
+              <button className="solid" type="button" onClick={() => void confirmInit()}>
+                作る
               </button>
             </div>
           </section>
@@ -1417,26 +1341,10 @@ function PaneGlyph() {
   );
 }
 
-function TaskIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M3 3.25h10v7.1H6.2L3 12.75V3.25z" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
 function FolderIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
       <path d="M2.4 4.2h3.7l1.2 1.35h6.3v6.25H2.4V4.2z" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function PlusIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M8 3.25v9.5M3.25 8h9.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
@@ -1457,14 +1365,6 @@ function GearIcon() {
         fill="currentColor"
         d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.1 7.1 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.58.22-1.13.54-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.31.6.22l2.39-.96c.5.4 1.05.72 1.63.94l.36 2.54c.05.24.25.42.49.42h3.8c.24 0 .44-.18.49-.42l.36-2.54c.58-.22 1.13-.54 1.63-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"
       />
-    </svg>
-  );
-}
-
-function SendIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M8 12.2V3.8M8 3.8 4.4 7.4M8 3.8l3.6 3.6" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

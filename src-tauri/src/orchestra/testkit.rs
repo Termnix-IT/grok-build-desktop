@@ -186,6 +186,7 @@ pub fn fake_agent(id: &str, script: &Path) -> AgentSpec {
             script.to_string_lossy().into_owned(),
         ],
         prompt_via: PromptVia::Stdin,
+        prompt_prefix: String::new(),
         output: OutputFormat::Text,
         role: String::new(),
         allow_dangerous: false,

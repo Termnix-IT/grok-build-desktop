@@ -110,9 +110,34 @@ fn prompt_for(id: &str) -> String {
     format!(r#"「{id}」さんへの依頼です。日本語と記号 "引用" & 100%"#)
 }
 
+fn prefix_for(id: &str) -> String {
+    match id {
+        "claude" | "antigravity" => "実行時の注意事項".into(),
+        "grok" => {
+            config::defaults()
+                .agents
+                .into_iter()
+                .find(|agent| agent.id == id)
+                .unwrap()
+                .prompt_prefix
+        }
+        _ => String::new(),
+    }
+}
+
+fn delivered_prompt(id: &str) -> String {
+    let prefix = prefix_for(id);
+    let prompt = prompt_for(id);
+    if prefix.is_empty() {
+        prompt
+    } else {
+        format!("{prefix}\n\n{prompt}")
+    }
+}
+
 fn agent_script(case: &AgentCase) -> String {
     let id = case.id;
-    let expected = prompt_for(id);
+    let expected = delivered_prompt(id);
     let read_prompt = case.read_prompt;
     let output = case.output;
     // PowerShell's script parameter parsing can reinterpret switches after -File.
@@ -235,6 +260,7 @@ async fn each_agent_kind_runs_through_gbd() {
                 agent.output = spec.output;
                 agent.prompt_via = spec.prompt_via;
             }
+            agent.prompt_prefix = prefix_for(case.id);
             agent.args.extend(case.args.iter().map(|arg| (*arg).into()));
         }
     })
@@ -278,18 +304,47 @@ async fn each_agent_kind_runs_through_gbd() {
         assert_eq!(done["denied"], json!(case.denied), "{done}");
         assert_eq!(done["task_id"], task.as_str());
         assert_eq!(done["task"]["jobs"], index + 1);
-        assert!(done["recovery_point"].is_string(), "{done}");
+        let tree = done["recovery_point"].as_str().unwrap();
+        assert_eq!(
+            done["recovery_command"],
+            format!("git restore --source={tree} --worktree -- .")
+        );
 
         let file = format!("{id}.txt");
         let changes = done["changed_files"].as_array().unwrap();
         assert_eq!(changes.len(), 1, "{done}");
         assert_eq!(changes[0]["path"], file);
         assert_eq!(changes[0]["change"], "untracked");
-        assert_eq!(fs::read_to_string(kit.repo.join(file)).unwrap(), prompt);
+        assert_eq!(
+            fs::read_to_string(kit.repo.join(file)).unwrap(),
+            delivered_prompt(id)
+        );
+        assert_eq!(kit.hub.job(job_id).unwrap().run.prompt, prompt);
 
-        let log = gbd(&pipe, &["log", job_id, "--tail", "200"]).await;
+        let brief = gbd(&pipe, &["log", job_id, "--tail", "200"]).await;
+        let raw = gbd(&pipe, &["log", job_id, "--raw", "--tail=200"]).await;
         let stream = if id == "custom" { "stderr" } else { "stdout" };
-        assert!(has_log(&log, stream, &format!("marker {id}")), "{log}");
+        assert!(has_log(&raw, stream, &format!("marker {id}")), "{raw}");
+        let line = match id {
+            "codex" | "grok" => format!("[文章] {id} 完了"),
+            "claude" | "antigravity" => format!("[結果] {id} 完了"),
+            _ => format!("{id} 完了"),
+        };
+        assert!(has_log(&brief, "stdout", &line), "{brief}");
+        if id == "custom" {
+            assert!(
+                has_log(&brief, "stderr", "[stderr] marker custom"),
+                "{brief}"
+            );
+        } else {
+            let contains_json = |log: &Value| {
+                log["lines"].as_array().unwrap().iter().any(|line| {
+                    line["stream"] == "stdout" && line["text"].as_str().unwrap().starts_with('{')
+                })
+            };
+            assert!(contains_json(&raw), "{raw}");
+            assert!(!contains_json(&brief), "{brief}");
+        }
     }
 }
 
@@ -322,6 +377,11 @@ while (-not (Test-Path -LiteralPath 'go' -PathType Leaf)) {
     let quick_id = quick["job_id"].as_str().unwrap();
     let queued = gbd(&pipe, &["status", quick_id]).await;
     assert_eq!(queued["status"], "queued", "{queued}");
+    let queued_result = gbd(&pipe, &["result", quick_id]).await;
+    assert!(
+        queued_result.get("recovery_command").unwrap().is_null(),
+        "{queued_result}"
+    );
     assert!(
         queued["position"].as_u64().is_some_and(|n| n >= 1),
         "{queued}"

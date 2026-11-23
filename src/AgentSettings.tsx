@@ -221,6 +221,15 @@ export function AgentSettings({
                 <span>役割</span>
                 <textarea rows={2} value={agent.role} onChange={(event) => patchAgent(agent.id, { role: event.target.value })} />
               </label>
+              <label className="field wide">
+                <span>プロンプトの前置き</span>
+                <textarea
+                  rows={2}
+                  maxLength={2000}
+                  value={agent.promptPrefix ?? ""}
+                  onChange={(event) => patchAgent(agent.id, { promptPrefix: event.target.value })}
+                />
+              </label>
             </div>
             <button
               type="button"
