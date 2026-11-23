@@ -278,8 +278,36 @@ export function sameProject(a: string, b: string) {
   return normalizeProject(a) === normalizeProject(b);
 }
 
+/** The hub compares canonical paths with their case, since a folder can be case sensitive even
+ * on Windows, so only the separators are made the same here. */
 function normalizeProject(path: string) {
-  return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  return path.replace(/\//g, "\\").replace(/\\+$/, "");
+}
+
+/** Every project the screen should list: the folders Grok Bot may use, in the saved order, then
+ * the folders of tasks that are no longer allowed, so no task is left without a place. */
+export function projectList(allowed: string[], tasks: TaskMap) {
+  const list: string[] = [];
+  const add = (path: string) => {
+    if (path && !list.some((item) => sameProject(item, path))) list.push(path);
+  };
+  allowed.forEach(add);
+  Object.values(tasks)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .forEach((task) => add(task.project));
+  return list;
+}
+
+/** The strongest mark among a project's tasks: running, then waiting, then needs a look. */
+export function projectBadge(tasks: TaskRecord[]): { badge: Badge; label: string } | null {
+  if (tasks.some((task) => task.runs.some((run) => run.status === "running"))) {
+    return { badge: "spin", label: RUN_STATUS_LABEL.running };
+  }
+  if (tasks.some((task) => task.runs.some((run) => run.status === "queued"))) {
+    return { badge: "wait", label: RUN_STATUS_LABEL.queued };
+  }
+  if (tasks.some((task) => task.status === "paused")) return { badge: "ask", label: TASK_STATUS_LABEL.paused };
+  return null;
 }
 
 type TaskMap = OrchestraState["tasks"];

@@ -201,22 +201,27 @@ const JobCard = memo(function JobCard({
 });
 
 function RecoveryPoint({ hash }: { hash: string }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState("");
+  const copy = (label: string, text: string) => {
+    void navigator.clipboard
+      .writeText(text)
+      .then(() => setCopied(label))
+      .catch(() => setCopied(""));
+  };
   return (
     <p className="flow-recovery">
       <span className="flow-meta">作業前</span>
       <code title={hash}>{hash.slice(0, 12)}</code>
+      <button type="button" className="flow-log" onClick={() => copy("id", hash)}>
+        {copied === "id" ? "コピーしました" : "コピー"}
+      </button>
       <button
         type="button"
         className="flow-log"
-        onClick={() => {
-          void navigator.clipboard
-            .writeText(hash)
-            .then(() => setCopied(true))
-            .catch(() => setCopied(false));
-        }}
+        title={`git restore --source=${hash} --worktree -- .`}
+        onClick={() => copy("restore", `git restore --source=${hash} --worktree -- .`)}
       >
-        {copied ? "コピーしました" : "コピー"}
+        {copied === "restore" ? "コピーしました" : "戻すコマンド"}
       </button>
     </p>
   );

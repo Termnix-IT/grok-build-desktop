@@ -289,6 +289,24 @@ impl AgentState {
         }
     }
 
+    /// A host that never starts the Grok chat process. Every chat command then fails with a
+    /// closed connection, and the screen does not send any.
+    pub fn disabled() -> Self {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tx,
+            wake: Arc::new(Notify::new()),
+            shutdown: Arc::new(AtomicBool::new(true)),
+            folder: Arc::new(Mutex::new(None)),
+            our_pid: Arc::new(Mutex::new(None)),
+            mirror: Arc::new(Mutex::new(Mirror::default())),
+            images: Arc::new(ImageStore::new()),
+            prompt_image: Arc::new(AtomicBool::new(false)),
+            auto_approve: Arc::new(AtomicBool::new(false)),
+            join: Mutex::new(None),
+        }
+    }
+
     pub fn set_auto_approve(&self, enabled: bool) {
         self.auto_approve.store(enabled, Ordering::SeqCst);
     }

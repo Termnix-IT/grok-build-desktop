@@ -27,6 +27,7 @@ function usageText(cliPath: string, project: string) {
     "& $gbd version",
     "& $gbd agents",
     "& $gbd submit job.json",
+    "& $gbd status <job_id>",
     "& $gbd wait <job_id> --timeout 600",
     "& $gbd result <job_id>",
     "& $gbd log <job_id> --tail 50",
@@ -53,7 +54,15 @@ function sameDraft(draft: Draft, view: GatewayView) {
   );
 }
 
-export function GatewaySettings({ folders, live }: { folders: string[]; live: GatewayState }) {
+export function GatewaySettings({
+  folders,
+  live,
+  onSaved,
+}: {
+  folders: string[];
+  live: GatewayState;
+  onSaved: (view: GatewayView) => void;
+}) {
   const [view, setView] = useState<GatewayView | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const viewRef = useRef<GatewayView | null>(null);
@@ -129,6 +138,7 @@ export function GatewaySettings({ folders, live }: { folders: string[]; live: Ga
       viewRef.current = next;
       setView(next);
       setDraft(toDraft(next));
+      onSaved(next);
       setNote("保存しました");
     } catch (error) {
       setNote(errorText(error));

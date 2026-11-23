@@ -493,6 +493,39 @@ impl Orchestra {
         }
         Ok(self.gateway_view())
     }
+    /// Adds one folder to the allowed list under the lock, so an emergency stop that turned the
+    /// gateway off in the meantime is not undone by an older copy of the settings.
+    pub fn gateway_add_project(&self, project: &str) -> Result<serde_json::Value, String> {
+        let project = normalize_project(project).map_err(|e| e.message)?;
+        {
+            let mut core = lock(&self.inner.core);
+            if !core.gateway.allowed_projects.contains(&project) {
+                let mut settings = core.gateway.clone();
+                settings.allowed_projects.push(project);
+                self.write_gateway(&settings)?;
+                core.gateway = settings;
+                self.gateway_event(&core, None);
+            }
+        }
+        Ok(self.gateway_view())
+    }
+    /// The folders that have a task record, so a folder taken off the allowed list keeps its history.
+    pub fn projects(&self) -> Vec<String> {
+        let core = lock(&self.inner.core);
+        let mut tasks: Vec<_> = core.tasks.values().collect();
+        tasks.sort_by_key(|t| t.created_at);
+        let mut projects: Vec<String> = Vec::new();
+        for task in tasks {
+            if !projects.contains(&task.project) {
+                projects.push(task.project.clone());
+            }
+        }
+        projects
+    }
+    /// The same canonical form the hub stores, so the screen compares paths the way the hub does.
+    pub fn normalize(&self, project: &str) -> Result<String, String> {
+        normalize_project(project).map_err(|e| e.message)
+    }
     fn write_gateway(&self, settings: &GatewaySettings) -> Result<(), String> {
         let parent = self
             .inner
@@ -1780,6 +1813,38 @@ mod tests {
         let second = kit.finish(&second.job_id).await.run;
         assert_eq!(second.status, RunStatus::Succeeded);
         assert!(second.started_at.unwrap() >= first.ended_at.unwrap());
+    }
+
+    #[tokio::test]
+    async fn adding_a_project_keeps_the_gateway_off_and_lists_task_folders() {
+        let kit = Kit::new(&[("quick", QUICK)], |_| {}).await;
+        let repo = kit.repo.to_string_lossy().into_owned();
+        kit.hub.gateway_save(false, vec![]).unwrap();
+        let other = kit.root.join("other");
+        make_repo(&other);
+        let view = kit
+            .hub
+            .gateway_add_project(&other.to_string_lossy())
+            .unwrap();
+        assert_eq!(view["accepting"], false);
+        let normalized = kit.hub.normalize(&other.to_string_lossy()).unwrap();
+        assert_eq!(
+            view["allowedProjects"],
+            serde_json::json!([normalized.clone()])
+        );
+        // Adding the same folder again changes nothing.
+        let again = kit
+            .hub
+            .gateway_add_project(&other.to_string_lossy())
+            .unwrap();
+        assert_eq!(again["allowedProjects"], serde_json::json!([normalized]));
+
+        assert!(kit.hub.projects().is_empty());
+        kit.hub
+            .submit(kit.job("quick", "x"), Source::Manual)
+            .await
+            .unwrap();
+        assert_eq!(kit.hub.projects(), [kit.hub.normalize(&repo).unwrap()]);
     }
 
     #[tokio::test]

@@ -1236,3 +1236,12 @@ button:disabled:hover { background: transparent; }
 .gateway-rejections { list-style: none; margin: 0; padding: 0; }
 .gateway-rejections li { display: flex; align-items: center; gap: 8px; min-height: 26px; font-size: 12.5px; }
 .gateway-rejections code { color: var(--muted); font-size: 11.5px; }
+
+/* 連携だけの画面: 左のフォルダの印と、右の列のプロジェクトの欄 */
+.folder-node .folder-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-node .badge { margin-left: auto; }
+.context dt { flex: none; }
+.context dd { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+.context dd.warn { color: #f07167; }
+.context .side-head h2 { flex: none; white-space: nowrap; }
+.context .side-head strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

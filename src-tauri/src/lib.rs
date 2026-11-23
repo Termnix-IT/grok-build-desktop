@@ -107,8 +107,15 @@ fn login() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn search_files(state: State<'_, AgentState>, query: String) -> Result<Vec<String>, String> {
-    let folder = state.folder();
+fn search_files(
+    state: State<'_, AgentState>,
+    query: String,
+    project: Option<String>,
+) -> Result<Vec<String>, String> {
+    let folder = project
+        .filter(|path| !path.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| state.folder());
     let Some(folder) = folder else {
         return Err("先にプロジェクトフォルダを選んでください".into());
     };
@@ -222,6 +229,24 @@ fn orchestrator_tasks(state: State<'_, Orchestra>, project: String) -> Vec<TaskR
 }
 
 #[tauri::command]
+fn orchestrator_projects(state: State<'_, Orchestra>) -> Vec<String> {
+    state.projects()
+}
+
+#[tauri::command]
+fn orchestrator_normalize(state: State<'_, Orchestra>, project: String) -> Result<String, String> {
+    state.normalize(&project)
+}
+
+#[tauri::command]
+fn gateway_add_project(
+    state: State<'_, Orchestra>,
+    project: String,
+) -> Result<serde_json::Value, String> {
+    state.gateway_add_project(&project)
+}
+
+#[tauri::command]
 fn orchestrator_task(state: State<'_, Orchestra>, task_id: String) -> Option<TaskRecord> {
     state.task(&task_id)
 }
@@ -268,6 +293,9 @@ pub fn gbd_main() -> i32 {
     orchestra::cli::main()
 }
 
+/// The Grok chat screen was removed in favour of 連携. Turning this on starts the ACP host again.
+const CHAT_ENABLED: bool = false;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -275,7 +303,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let state = AgentState::start(app.handle().clone());
+            // The screen only shows 連携 now. The ACP host stays in the code but does not start
+            // a Grok chat process.
+            let state = if CHAT_ENABLED {
+                AgentState::start(app.handle().clone())
+            } else {
+                AgentState::disabled()
+            };
             app.manage(state);
             let config_dir = app.path().app_config_dir()?;
             let orchestra = Orchestra::new(
@@ -335,6 +369,9 @@ pub fn run() {
             orchestrator_resume_project,
             orchestrator_tasks,
             orchestrator_task,
+            orchestrator_projects,
+            orchestrator_normalize,
+            gateway_add_project,
             orchestrator_delete,
             orchestrator_snapshot,
             agent_log,
