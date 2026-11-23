@@ -1,8 +1,35 @@
-use std::{collections::BTreeSet, ffi::OsStr, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeSet,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
-use super::runner::{child_path, no_window};
+use super::runner::{child_path, no_window, resolve_program};
+
+/// git.exe as an absolute path. Searching by name could fall back to the app's PATH, whose
+/// relative entries would be resolved against the app's current folder. Only `git.exe` itself
+/// is used: a `git.cmd` earlier in PATH would run through cmd.exe, which parses the arguments
+/// again.
+fn git_program() -> Result<PathBuf, String> {
+    static GIT: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(git) = GIT.get() {
+        return Ok(git.clone());
+    }
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    let git = resolve_program(name)?;
+    if !git
+        .file_name()
+        .is_some_and(|file| file.eq_ignore_ascii_case(name))
+    {
+        return Err(format!("{name} が見つかりません"));
+    }
+    Ok(GIT.get_or_init(|| git).clone())
+}
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -19,12 +46,38 @@ async fn run_git_with(
     env: &[(&str, &OsStr)],
     secs: u64,
 ) -> Result<Vec<u8>, String> {
+    run_git_input(dir, config, args, env, None, secs).await
+}
+
+async fn run_git_input(
+    dir: &Path,
+    config: &[(String, String)],
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    input: Option<&[u8]>,
+    secs: u64,
+) -> Result<Vec<u8>, String> {
     // An agent can write `.git/config` and `.git/hooks`. Git started here runs outside the
     // agent's sandbox, so it must not start the repository's fsmonitor or hooks, or fetch
     // (a missing object in a partial clone would fetch with the repository's ssh command).
     // The hooks folder is a random path that is never created.
     let hooks = std::env::temp_dir().join(format!("gbd-no-hooks-{}", uuid::Uuid::new_v4()));
-    let mut command = std::process::Command::new("git");
+    let mut command = std::process::Command::new(git_program()?);
+    // Variables from the app's environment that would make git read another config, repository,
+    // index or object store than the one listed by `Repo::open`.
+    for name in [
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(name);
+    }
     command
         .arg("-C")
         .arg(dir)
@@ -41,8 +94,15 @@ async fn run_git_with(
         // Read-only commands must not refresh and rewrite the real index.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        // `protocol.<name>.allow` in the repository's config beats `protocol.allow=never`;
+        // an empty allow list beats both.
+        .env("GIT_ALLOW_PROTOCOL", "")
         .envs(env.iter().copied())
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // `-c key=value` splits at the first `=`, so a driver named `a=b` could not be switched
@@ -60,11 +120,34 @@ async fn run_git_with(
     no_window(&mut command);
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(secs), command.output())
+    let run = async {
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("git を起動できませんでした: {err}"))?;
+        let stdin = child.stdin.take();
+        // Written while git runs, so a full output pipe cannot stall the write. Dropping the
+        // handle closes git's input. On Windows the last write only reports back on flush.
+        let write = async move {
+            match (stdin, input) {
+                (Some(mut stdin), Some(input)) => {
+                    use tokio::io::AsyncWriteExt;
+                    stdin.write_all(input).await?;
+                    stdin.flush().await
+                }
+                _ => Ok(()),
+            }
+        };
+        let (written, output) = tokio::join!(write, child.wait_with_output());
+        output
+            .map(|output| (written, output))
+            .map_err(|err| format!("git を起動できませんでした: {err}"))
+    };
+    let (written, output) = tokio::time::timeout(Duration::from_secs(secs), run)
         .await
-        .map_err(|_| format!("git が {secs} 秒以内に終わりませんでした"))?
-        .map_err(|err| format!("git を起動できませんでした: {err}"))?;
+        .map_err(|_| format!("git が {secs} 秒以内に終わりませんでした"))??;
     if output.status.success() {
+        // Git would also succeed on part of its input, so a failed write fails the call.
+        written.map_err(|err| format!("git に入力を渡せませんでした: {err}"))?;
         return Ok(output.stdout);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -85,22 +168,63 @@ async fn run_git_with(
 /// [`filters_off`] for which ones stay on.
 struct Repo<'a> {
     dir: &'a Path,
+    /// The top of the working tree. The project may be a folder inside it.
+    top: PathBuf,
+    /// The git folder found from `dir`. Named outright when git runs elsewhere, since git
+    /// started at `top` could find another repository (with `core.worktree`).
+    git_dir: PathBuf,
     filters_off: Vec<(String, String)>,
 }
 
 impl<'a> Repo<'a> {
     async fn open(dir: &'a Path) -> Result<Self, String> {
-        let list = run_git_with(
-            dir,
-            &[],
-            &["config", "--list", "--show-scope", "--show-origin", "-z"],
-            &[],
-            10,
-        )
-        .await?;
+        let (list, places) = tokio::join!(
+            run_git_with(
+                dir,
+                &[],
+                &["config", "--list", "--show-scope", "--show-origin", "-z"],
+                &[],
+                10,
+            ),
+            run_git_with(
+                dir,
+                &[],
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--git-dir",
+                    "--git-common-dir",
+                ],
+                &[],
+                10,
+            ),
+        );
+        // The project may be a subfolder of the working tree, and a linked worktree keeps its
+        // git folder elsewhere. Config read from any of these places is not trusted, so a
+        // folder that cannot be found makes the whole repository unusable.
+        let unknown = || "git の作業ツリーのフォルダを読み取れませんでした".to_owned();
+        let places = places?;
+        let places: Vec<PathBuf> = std::str::from_utf8(&places)
+            .map_err(|_| unknown())?
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+        let [top, git_dir, _] = places.as_slice() else {
+            return Err(unknown());
+        };
+        if places.iter().any(|place| place.canonicalize().is_err()) {
+            return Err(unknown());
+        }
+        let (top, git_dir) = (top.clone(), git_dir.clone());
+        let mut writable = vec![dir.to_owned()];
+        writable.extend(places);
         Ok(Self {
             dir,
-            filters_off: filters_off(&list, dir),
+            // Git runs from the top of the working tree and prints relative origins from there.
+            filters_off: filters_off(&list?, &top, &writable),
+            top,
+            git_dir,
         })
     }
 
@@ -115,6 +239,24 @@ impl<'a> Repo<'a> {
         secs: u64,
     ) -> Result<Vec<u8>, String> {
         run_git_with(self.dir, &self.filters_off, args, env, secs).await
+    }
+
+    /// Runs at the top of the working tree, where paths are relative to the whole tree, in the
+    /// same repository that `open` found.
+    async fn run_at_top(
+        &self,
+        args: &[&str],
+        env: &[(&str, &OsStr)],
+        input: Option<&[u8]>,
+        secs: u64,
+    ) -> Result<Vec<u8>, String> {
+        let git_dir = format!("--git-dir={}", self.git_dir.display());
+        let work_tree = format!("--work-tree={}", self.top.display());
+        let args: Vec<&str> = [git_dir.as_str(), work_tree.as_str()]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        run_git_input(&self.top, &self.filters_off, &args, env, input, secs).await
     }
 
     async fn text(&self, args: &[&str]) -> Option<String> {
@@ -136,27 +278,33 @@ impl<'a> Repo<'a> {
 }
 
 /// The settings that switch filter drivers off. An entry is trusted only when it comes from
-/// the system or the user's config, read from a file outside the project folder (a global
-/// `include` may point into it). A driver with any untrusted entry is switched off. Git LFS
-/// runs the `lfs.extension.*` commands of the repository's config while it cleans, so an
-/// untrusted extension switches every driver off, Git LFS included.
+/// the system or the user's config, read from a file outside every `writable` folder (the
+/// project, the working tree, the git folders), since a global `include` may point into them.
+/// A driver with any untrusted entry is switched off. Git LFS runs the `lfs.extension.*`
+/// commands of the repository's config while it cleans, so an untrusted extension switches
+/// every driver off, Git LFS included.
 ///
 /// `--list --show-scope --show-origin -z` prints `scope NUL origin NUL key LF value NUL`.
-fn filters_off(list: &[u8], dir: &Path) -> Vec<(String, String)> {
-    let project = dir.canonicalize().ok();
+/// Relative origins are relative to `top`, the top of the working tree.
+fn filters_off(list: &[u8], top: &Path, writable: &[PathBuf]) -> Vec<(String, String)> {
+    // A folder that cannot be found could hold any origin, so then nothing is trusted.
+    let writable: Option<Vec<PathBuf>> = writable
+        .iter()
+        .map(|folder| top.join(folder).canonicalize().ok())
+        .collect();
     let mut outside = std::collections::HashMap::<Vec<u8>, bool>::new();
     let mut trusted = |origin: &[u8]| {
         *outside.entry(origin.to_vec()).or_insert_with(|| {
-            let Some(file) = origin.strip_prefix(b"file:") else {
+            let (Some(writable), Some(file)) = (&writable, origin.strip_prefix(b"file:")) else {
                 return false;
             };
-            let file = Path::new(std::str::from_utf8(file).unwrap_or_default());
-            let Ok(file) = dir.join(file).canonicalize() else {
+            let Ok(file) = std::str::from_utf8(file) else {
                 return false;
             };
-            project
-                .as_deref()
-                .is_some_and(|project| !file.starts_with(project))
+            let Ok(file) = top.join(file).canonicalize() else {
+                return false;
+            };
+            !writable.is_empty() && !writable.iter().any(|folder| file.starts_with(folder))
         })
     };
     let mut fields = list.split(|b| *b == 0);
@@ -230,6 +378,9 @@ pub async fn preflight(dir: &Path) -> Preflight {
 /// `git restore --source=<tree> --worktree -- .` brings the files back.
 pub struct Snapshot {
     pub base: Option<String>,
+    /// The filters switched off when the tree was written. The tree after the step must be
+    /// hashed the same way, or files would differ only in how they were stored.
+    filters_off: Vec<(String, String)>,
 }
 
 /// Snapshots may hash many files, so they get more time than the quick queries.
@@ -238,13 +389,41 @@ const TREE_SECS: u64 = 120;
 /// Writes every file git does not ignore (tracked, changed and untracked) as a tree object.
 /// It works on a copy of the index, so the real index, the stash list and the files are left
 /// alone, and later edits to a file that was already untracked still show up in the diff.
+/// With filters switched off, the copy is not used: its entries were cleaned by the filters
+/// (Git LFS pointers), and only the files git hashes again would lose that, so untouched files
+/// would look changed. Instead the index starts from `HEAD` without file times, and every path
+/// of the real index is hashed again, so a file added with `--force` despite an ignore rule
+/// stays in.
 async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
     let index = repo.run(&["rev-parse", "--git-path", "index"]).await?;
     let index = repo.dir.join(String::from_utf8_lossy(&index).trim());
     let temp = std::env::temp_dir().join(format!("gbd-index-{}", uuid::Uuid::new_v4()));
     let result = async {
         let env = [("GIT_INDEX_FILE", temp.as_os_str())];
-        if std::fs::copy(&index, &temp).is_err() {
+        if !repo.filters_off.is_empty() {
+            let tracked = repo
+                .run_at_top(&["ls-files", "-z"], &[], None, TREE_SECS)
+                .await?;
+            repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
+                .await?;
+            if !tracked.is_empty() {
+                repo.run_at_top(
+                    // `--replace`: a file in `HEAD` may be a folder in the index, or the reverse.
+                    &[
+                        "update-index",
+                        "--add",
+                        "--remove",
+                        "--replace",
+                        "-z",
+                        "--stdin",
+                    ],
+                    &env,
+                    Some(&tracked),
+                    TREE_SECS,
+                )
+                .await?;
+            }
+        } else if std::fs::copy(&index, &temp).is_err() {
             repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
                 .await?;
         }
@@ -268,6 +447,7 @@ pub async fn snapshot(dir: &Path) -> Result<Snapshot, String> {
     }
     Ok(Snapshot {
         base: Some(worktree_tree(&repo).await?),
+        filters_off: repo.filters_off,
     })
 }
 
@@ -315,6 +495,11 @@ pub async fn changes(dir: &Path, snap: &Snapshot, limit: usize) -> Result<Change
         return Ok(Changes::default());
     };
     let repo = Repo::open(dir).await?;
+    if repo.filters_off != snap.filters_off {
+        return Err(
+            "作業中に filter の設定が変わったため、作業前と同じ方法で比べられません".into(),
+        );
+    }
     let after = worktree_tree(&repo).await?;
     let range = [base.as_str(), after.as_str()];
     let status_args: Vec<&str> = DIFF_ARGS
@@ -639,38 +824,64 @@ mod tests {
 
     #[test]
     fn only_trusted_filters_stay_on() {
-        let dir = std::env::temp_dir().join(format!("gbd-filters-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("inside.inc"), "").unwrap();
+        // The project is a subfolder of the working tree.
+        let top = std::env::temp_dir().join(format!("gbd-filters-{}", uuid::Uuid::new_v4()));
+        let project = top.join("project");
+        let gitdir = top.join(".git");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(project.join("inside.inc"), "").unwrap();
+        fs::write(top.join("top.inc"), "").unwrap();
+        fs::write(gitdir.join("git.inc"), "").unwrap();
         let outside =
             std::env::temp_dir().join(format!("gbd-outside-{}.inc", uuid::Uuid::new_v4()));
         fs::write(&outside, "").unwrap();
         let entry = |scope: &str, origin: &str, key: &str| format!("{scope}\0{origin}\0{key}\nv\0");
-        let global = format!("file:{}", outside.display());
-        let inside = format!("file:{}", dir.join("inside.inc").display());
+        let file = |path: &Path| format!("file:{}", path.display());
+        let global = file(&outside);
         let list = [
             entry("global", &global, "filter.lfs.clean"),
             entry("global", &global, "filter.lfs.process"),
             entry("local", "file:.git/config", "filter.My.Driver.clean"),
             entry("worktree", "file:.git/config.worktree", "filter.w.required"),
-            // A global include that reads a file inside the project.
-            entry("global", &inside, "filter.included.clean"),
+            // Global includes that read files the agent can write.
+            entry(
+                "global",
+                &file(&project.join("inside.inc")),
+                "filter.included.clean",
+            ),
+            // Relative to the top of the working tree, outside the project folder.
+            entry("global", "file:top.inc", "filter.top.clean"),
+            entry(
+                "global",
+                &file(&gitdir.join("git.inc")),
+                "filter.gitdir.clean",
+            ),
+            entry(
+                "global",
+                &file(&top.join("missing.inc")),
+                "filter.missing.clean",
+            ),
             entry("command", "command line:", "filter.cmd.clean"),
             entry("local", "file:.git/config", "core.bare"),
         ]
         .concat();
+        let writable = [project.clone(), top.clone(), gitdir.clone()];
         let names = |off: &[(String, String)]| -> BTreeSet<String> {
             off.iter()
                 .map(|(key, _)| key.rsplit_once('.').unwrap().0.to_owned())
                 .collect()
         };
-        let off = filters_off(list.as_bytes(), &dir);
+        let off = filters_off(list.as_bytes(), &top, &writable);
         assert_eq!(
             names(&off),
             [
                 "filter.My.Driver",
                 "filter.cmd",
+                "filter.gitdir",
                 "filter.included",
+                "filter.missing",
+                "filter.top",
                 "filter.w"
             ]
             .map(str::to_owned)
@@ -683,9 +894,144 @@ mod tests {
             "{list}{}",
             entry("local", "file:.git/config", "lfs.extension.x.clean")
         );
-        assert!(names(&filters_off(extension.as_bytes(), &dir)).contains("filter.lfs"));
-        let _ = fs::remove_dir_all(&dir);
+        assert!(names(&filters_off(extension.as_bytes(), &top, &writable)).contains("filter.lfs"));
+        let _ = fs::remove_dir_all(&top);
         let _ = fs::remove_file(&outside);
+    }
+
+    /// A filter that stores files differently (as Git LFS stores pointers) must not make
+    /// untouched files look changed once the filter is switched off.
+    #[tokio::test]
+    async fn filtered_files_compare_the_same_way() {
+        let Some(repo) = repository().await else {
+            return;
+        };
+        fs::write(repo.0.join(".gitattributes"), "*.dat filter=p\n").unwrap();
+        assert!(
+            git(
+                &repo.0,
+                &["config", "filter.p.clean", "cat >/dev/null; echo pointer"]
+            )
+            .await
+            .is_some()
+        );
+        let data = repo.0.join("data.dat");
+        let touch = |when: std::time::SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(&data)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        fs::write(&data, "real content\n").unwrap();
+        commit(&repo.0).await;
+        // As long after the commit as a real step: the index entry matches the file, so git
+        // would keep the stored pointer instead of hashing the file again.
+        touch(std::time::SystemTime::now() - Duration::from_secs(100));
+        assert!(
+            git(&repo.0, &["update-index", "-q", "--refresh"])
+                .await
+                .is_some()
+        );
+        // A file added with `--force` despite an ignore rule, not committed yet.
+        fs::write(repo.0.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(repo.0.join("forced.log"), "kept\n").unwrap();
+        assert!(git(&repo.0, &["add", "-f", "forced.log"]).await.is_some());
+        let snap = snapshot(&repo.0).await.unwrap();
+        // The step rewrites the file with the same content, so git hashes it again.
+        fs::write(&data, "real content\n").unwrap();
+        touch(std::time::SystemTime::now() + Duration::from_secs(10));
+        fs::write(repo.0.join("b.txt"), "b\n").unwrap();
+        fs::remove_file(repo.0.join("forced.log")).unwrap();
+        let found = changes(&repo.0, &snap, 200).await.unwrap();
+        let paths: Vec<_> = found
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.change))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("forced.log", FileChange::Deleted),
+                ("b.txt", FileChange::Untracked)
+            ]
+        );
+        // A filter set up during the step changes how files are hashed, so the diff is refused.
+        assert!(
+            git(&repo.0, &["config", "filter.New.clean", "cat"])
+                .await
+                .is_some()
+        );
+        assert!(changes(&repo.0, &snap, 200).await.is_err());
+    }
+
+    /// A project in a folder of the working tree, with a filter switched off, so the paths of
+    /// the real index are hashed again from the top of the working tree.
+    #[tokio::test]
+    async fn a_project_inside_the_working_tree() {
+        let Some(repo) = repository().await else {
+            return;
+        };
+        let sub = repo.0.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.txt"), "a\n").unwrap();
+        fs::write(repo.0.join("top.txt"), "top\n").unwrap();
+        commit(&repo.0).await;
+        assert!(
+            git(&repo.0, &["config", "filter.x.clean", "cat"])
+                .await
+                .is_some()
+        );
+        // Outside the project folder, added with `--force` despite an ignore rule.
+        fs::write(repo.0.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(repo.0.join("outside.log"), "kept\n").unwrap();
+        assert!(git(&repo.0, &["add", "-f", "outside.log"]).await.is_some());
+        let snap = snapshot(&sub).await.unwrap();
+        fs::write(sub.join("a.txt"), "changed\n").unwrap();
+        fs::remove_file(repo.0.join("outside.log")).unwrap();
+        let found = changes(&sub, &snap, 200).await.unwrap();
+        let paths: Vec<_> = found
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.change))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("outside.log", FileChange::Deleted),
+                ("sub/a.txt", FileChange::Modified)
+            ]
+        );
+    }
+
+    /// With a filter switched off, a file in `HEAD` that the index already has as a folder
+    /// still gives a snapshot.
+    #[tokio::test]
+    async fn a_file_replaced_by_a_folder() {
+        let Some(repo) = repository().await else {
+            return;
+        };
+        fs::write(repo.0.join("p"), "file\n").unwrap();
+        commit(&repo.0).await;
+        assert!(
+            git(&repo.0, &["config", "filter.x.clean", "cat"])
+                .await
+                .is_some()
+        );
+        fs::remove_file(repo.0.join("p")).unwrap();
+        fs::create_dir_all(repo.0.join("p")).unwrap();
+        fs::write(repo.0.join("p").join("f"), "inside\n").unwrap();
+        assert!(git(&repo.0, &["add", "-A"]).await.is_some());
+        let snap = snapshot(&repo.0).await.unwrap();
+        fs::write(repo.0.join("p").join("f"), "changed\n").unwrap();
+        let found = changes(&repo.0, &snap, 200).await.unwrap();
+        let paths: Vec<_> = found
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.change))
+            .collect();
+        assert_eq!(paths, [("p/f", FileChange::Modified)]);
     }
 
     #[tokio::test]
@@ -694,7 +1040,10 @@ mod tests {
         let check = preflight(&dir).await;
         assert!(!check.is_git && !check.has_commit && check.branch.is_none());
         assert!(snapshot(&dir).await.is_err());
-        let snap = Snapshot { base: None };
+        let snap = Snapshot {
+            base: None,
+            filters_off: Vec::new(),
+        };
         assert_eq!(changes(&dir, &snap, 10).await.unwrap(), Changes::default());
     }
 
