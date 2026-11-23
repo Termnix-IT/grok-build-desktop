@@ -1138,14 +1138,14 @@ impl Orchestra {
     pub fn job(&self, id: &str) -> Result<JobView, HubError> {
         job_view(&lock(&self.inner.core), id)
     }
-    pub async fn restore_preview(&self, job_id: &str) -> Result<Vec<git::RestoreFile>, HubError> {
+    pub async fn restore_preview(&self, job_id: &str) -> Result<git::RestorePlan, HubError> {
         let (project, tree) = recovery_point(&lock(&self.inner.core), job_id)?;
         git::restore_preview(Path::new(&project), &tree)
             .await
             .map_err(Into::into)
     }
 
-    pub async fn restore(&self, job_id: &str) -> Result<Vec<git::RestoreFile>, HubError> {
+    pub async fn restore(&self, job_id: &str) -> Result<git::RestorePlan, HubError> {
         // While submissions are locked, a project with no running or queued job
         // cannot gain a job for the worker to start.
         let _serial = self.inner.submissions.lock().await;
@@ -1823,7 +1823,7 @@ mod tests {
 
         let preview = kit.hub.restore_preview(&manual.job_id).await.unwrap();
         assert_eq!(
-            preview,
+            preview.files,
             [git::RestoreFile {
                 path: "tracked.txt".into(),
                 change: FileChange::Modified

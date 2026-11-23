@@ -63,10 +63,17 @@ interface RestoreFile {
   change: string;
 }
 
+interface RestorePlan {
+  files?: RestoreFile[];
+  /** Files made after the job started; going back leaves them in place. */
+  kept?: string[];
+}
+
 interface PendingRestore {
   jobId: string;
   project: string;
   files: RestoreFile[];
+  kept: string[];
   /** The files changed after the first preview, so the user confirms the new list. */
   changed?: boolean;
 }
@@ -151,6 +158,7 @@ export default function App() {
   const [logTarget, setLogTarget] = useState<LogTarget | null>(null);
   const [logView, setLogView] = useState<LogView>(readLogView);
   const [pendingTaskDelete, setPendingTaskDelete] = useState<string | null>(null);
+  const [pendingTaskClose, setPendingTaskClose] = useState<string | null>(null);
   const [pendingRestore, setPendingRestore] = useState<PendingRestore | null>(null);
   const [pendingInit, setPendingInit] = useState<string | null>(null);
   const [openTasks, setOpenTasks] = useState<string[]>([]);
@@ -426,17 +434,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const closeTask = useCallback((taskId: string) => {
+  /** Ending a task cannot be undone, so the card only asks; the dialog does it. */
+  const closeTask = useCallback((taskId: string) => setPendingTaskClose(taskId), []);
+
+  function confirmTaskClose(taskId: string) {
+    setPendingTaskClose(null);
     void hubCall("orchestrator_close", { taskId });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }
 
   /** Shows which files going back would overwrite before anything is touched. */
   const askRestore = useCallback(
     (jobId: string, project: string) => {
       setNotice("");
-      void invoke<{ files: RestoreFile[] }>("orchestrator_restore_preview", { jobId })
-        .then((result) => setPendingRestore({ jobId, project, files: result.files ?? [] }))
+      void invoke<RestorePlan>("orchestrator_restore_preview", { jobId })
+        .then((result) => setPendingRestore({ jobId, project, files: result.files ?? [], kept: result.kept ?? [] }))
         .catch(flowError);
     },
     [flowError],
@@ -449,14 +460,14 @@ export default function App() {
     setHubBusy(true);
     try {
       // A job may have changed the folder while the dialog was open; the list is shown again then.
-      const latest = await invoke<{ files: RestoreFile[] }>("orchestrator_restore_preview", { jobId: pending.jobId });
+      const latest = await invoke<RestorePlan>("orchestrator_restore_preview", { jobId: pending.jobId });
       const fresh = latest.files ?? [];
       const key = (files: RestoreFile[]) => files.map((file) => `${file.change}:${file.path}`).sort().join("\n");
       if (key(fresh) !== key(pending.files)) {
-        setPendingRestore({ ...pending, files: fresh, changed: true });
+        setPendingRestore({ ...pending, files: fresh, kept: latest.kept ?? [], changed: true });
         return;
       }
-      const result = await invoke<{ files: RestoreFile[] }>("orchestrator_restore", { jobId: pending.jobId });
+      const result = await invoke<RestorePlan>("orchestrator_restore", { jobId: pending.jobId });
       const count = result.files?.length ?? 0;
       setError("");
       setNotice(count ? `作業前の状態に ${count} 件のファイルを戻しました` : "戻すファイルはありませんでした");
@@ -825,6 +836,13 @@ export default function App() {
                 />
               )}
             </div>
+            {folder && !viewTask && (
+              <div className="welcome">
+                <p className="welcome-prompt">
+                  {projectTasks(orch.tasks, folder).length ? "左からタスクを選んでください" : "Grok Bot からのジョブはまだありません"}
+                </p>
+              </div>
+            )}
             {!folder && !viewTask && (
               <div className="welcome">
                 <p className="welcome-prompt">どのプロジェクトを見ますか？</p>
@@ -837,6 +855,9 @@ export default function App() {
             <LogDrawer
               target={logTarget}
               lines={(logView === "brief" ? orch.briefs : orch.logs)[logTarget.nodeId] ?? []}
+              done={Object.values(orch.tasks).some((task) =>
+                task.runs.some((run) => run.id === logTarget.nodeId && run.status !== "queued" && run.status !== "running"),
+              )}
               view={logView}
               onView={chooseLogView}
               onClose={closeLog}
@@ -1003,7 +1024,8 @@ export default function App() {
                   );
                 })}
               </div>
-              <div className="settings-pane" role="tabpanel">
+              {/* Keyed by page so each page opens at its top, not at the last page's scroll. */}
+              <div key={settingsPage} className="settings-pane" role="tabpanel">
                 {settingsPage === "display" && (
                   <div className="settings-frame">
                     <h3>画面アニメーション</h3>
@@ -1052,6 +1074,23 @@ export default function App() {
         </div>
       )}
 
+      {pendingTaskClose && (
+        <div className="modal">
+          <section>
+            <h3>このタスクを終えますか</h3>
+            <p>
+              Grok Bot はこのタスクに続きのジョブを送れなくなります。待ちのジョブは取り消し、実行中のジョブは止めます。
+              終えたタスクは再開できません。記録とファイルは残ります。
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setPendingTaskClose(null)}>やめる</button>
+              <button className="solid danger" type="button" onClick={() => confirmTaskClose(pendingTaskClose)}>
+                終える
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {pendingTaskDelete && (
         <div className="modal">
           <section>
@@ -1071,13 +1110,13 @@ export default function App() {
           <section>
             <h3>作業前の状態に戻しますか</h3>
             {pendingRestore.files.length === 0 ? (
-              <p>{baseName(pendingRestore.project)} で戻すファイルはありません。</p>
+              <p>{baseName(pendingRestore.project)} で上書きするファイルはありません。</p>
             ) : (
               <>
                 {pendingRestore.changed && <p className="warn-text">確認のあいだにファイルが変わりました。いまの一覧で確かめてください。</p>}
                 <p>
                   {baseName(pendingRestore.project)} の {pendingRestore.files.length} 件のファイルを、このジョブの前の内容で上書きします。
-                  いまの内容は失われます。あとから作られたファイルは消しません。
+                  いまの内容は失われます。
                 </p>
                 <ul className="restore-files">
                   {pendingRestore.files.map((file) => {
@@ -1089,6 +1128,19 @@ export default function App() {
                       </li>
                     );
                   })}
+                </ul>
+              </>
+            )}
+            {pendingRestore.kept.length > 0 && (
+              <>
+                <p>あとから作られた {pendingRestore.kept.length} 件は消さずに残します。要らなければ自分で消してください。</p>
+                <ul className="restore-files">
+                  {pendingRestore.kept.map((path) => (
+                    <li key={path}>
+                      <span className="file-mark" title={FILE_CHANGE_MARK.untracked.label}>{FILE_CHANGE_MARK.untracked.mark}</span>
+                      <span className="file-path">{path}</span>
+                    </li>
+                  ))}
                 </ul>
               </>
             )}

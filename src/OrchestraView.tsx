@@ -75,7 +75,7 @@ export function TaskTimeline({
         <span className="flow-path" title={task.project}>{task.project}</span>
         {task.status !== "closed" && (
           <button type="button" className="flow-log" disabled={busy} onClick={() => onClose(task.id)}>
-            閉じる
+            タスクを終える
           </button>
         )}
       </header>
@@ -271,12 +271,15 @@ function lastLine(text: string) {
 export function LogDrawer({
   target,
   lines,
+  done,
   view,
   onView,
   onClose,
 }: {
   target: LogTarget;
   lines: LogLine[];
+  /** The job has ended, so an empty log will stay empty. */
+  done: boolean;
   view: LogView;
   onView: (view: LogView) => void;
   onClose: () => void;
@@ -350,7 +353,9 @@ export function LogDrawer({
         }}
       >
         {lines.length === 0 ? (
-          <p className="log-empty">まだありません</p>
+          <p className="log-empty">
+            {done ? "ログは残っていません。ログは直近 50 ジョブ分だけで、アプリを閉じると消えます。" : "まだありません"}
+          </p>
         ) : (
           lines.map((line) => (
             <div key={line.seq} className={`log-line ${line.stream}`}>

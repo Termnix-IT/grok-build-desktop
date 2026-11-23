@@ -168,29 +168,22 @@ async fn orchestrator_git_init(
     state.git_init(Path::new(&project)).await
 }
 
-#[derive(serde::Serialize)]
-struct RestorePreview {
-    files: Vec<orchestra::git::RestoreFile>,
-}
-
 #[tauri::command]
 async fn orchestrator_restore_preview(
     app: tauri::AppHandle,
     job_id: String,
-) -> Result<RestorePreview, orchestra::engine::HubError> {
+) -> Result<orchestra::git::RestorePlan, orchestra::engine::HubError> {
     let state = app.state::<Orchestra>().inner().clone();
-    let files = state.restore_preview(&job_id).await?;
-    Ok(RestorePreview { files })
+    state.restore_preview(&job_id).await
 }
 
 #[tauri::command]
 async fn orchestrator_restore(
     app: tauri::AppHandle,
     job_id: String,
-) -> Result<RestorePreview, orchestra::engine::HubError> {
+) -> Result<orchestra::git::RestorePlan, orchestra::engine::HubError> {
     let state = app.state::<Orchestra>().inner().clone();
-    let files = state.restore(&job_id).await?;
-    Ok(RestorePreview { files })
+    state.restore(&job_id).await
 }
 
 #[tauri::command]

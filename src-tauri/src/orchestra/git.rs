@@ -645,20 +645,27 @@ pub struct RestoreFile {
     pub change: FileChange,
 }
 
+/// What going back would overwrite, and the files made since that it leaves in place.
+#[derive(Serialize, Debug, PartialEq, Eq, Default)]
+pub struct RestorePlan {
+    pub files: Vec<RestoreFile>,
+    pub kept: Vec<String>,
+}
+
 pub fn recovery_command(tree: &str) -> String {
     format!("git restore --source={tree} --worktree -- .")
 }
 
-pub async fn restore_preview(dir: &Path, tree: &str) -> Result<Vec<RestoreFile>, String> {
+pub async fn restore_preview(dir: &Path, tree: &str) -> Result<RestorePlan, String> {
     let repo = Repo::open(dir).await?;
     preview_restore(&repo, tree).await
 }
 
-pub async fn restore(dir: &Path, tree: &str) -> Result<Vec<RestoreFile>, String> {
+pub async fn restore(dir: &Path, tree: &str) -> Result<RestorePlan, String> {
     let repo = Repo::open(dir).await?;
     let preview = preview_restore(&repo, tree).await?;
-    if !preview.is_empty() {
-        check_restore_paths(repo.dir, &preview)?;
+    if !preview.files.is_empty() {
+        check_restore_paths(repo.dir, &preview.files)?;
         // Overlay preserves files absent from the recovery tree, including staged additions.
         repo.run_with(
             &[
@@ -717,7 +724,7 @@ fn restore_path(dir: &Path, relative: &str) -> Result<RestorePath, String> {
     Ok(RestorePath::Existing)
 }
 
-async fn preview_restore(repo: &Repo<'_>, tree: &str) -> Result<Vec<RestoreFile>, String> {
+async fn preview_restore(repo: &Repo<'_>, tree: &str) -> Result<RestorePlan, String> {
     if !matches!(tree.len(), 40 | 64)
         || !tree
             .bytes()
@@ -732,7 +739,7 @@ async fn preview_restore(repo: &Repo<'_>, tree: &str) -> Result<Vec<RestoreFile>
     // A file that was untracked at recovery time may now be ignored. Hash it
     // explicitly if it still exists so the preview can compare its real contents.
     let mut omitted = Vec::new();
-    for file in &preview {
+    for file in &preview.files {
         if file.change == FileChange::Deleted
             && matches!(restore_path(repo.dir, &file.path)?, RestorePath::Existing)
         {
@@ -760,11 +767,7 @@ async fn preview_restore(repo: &Repo<'_>, tree: &str) -> Result<Vec<RestoreFile>
     restore_diff(repo, tree, &index_tree(repo, &index).await?).await
 }
 
-async fn restore_diff(
-    repo: &Repo<'_>,
-    tree: &str,
-    current: &str,
-) -> Result<Vec<RestoreFile>, String> {
+async fn restore_diff(repo: &Repo<'_>, tree: &str, current: &str) -> Result<RestorePlan, String> {
     let status = repo
         .run_with(
             &[
@@ -774,7 +777,7 @@ async fn restore_diff(
                 "--no-renames",
                 "--relative",
                 "--name-status",
-                "--diff-filter=MDT",
+                "--diff-filter=ADMT",
                 "--ignore-submodules=all",
                 "-z",
                 tree,
@@ -786,10 +789,16 @@ async fn restore_diff(
             TREE_SECS,
         )
         .await?;
-    Ok(parse_name_status(&status)
-        .into_iter()
-        .map(|(change, path)| RestoreFile { path, change })
-        .collect())
+    // Overlay restore keeps files absent from the recovery tree, so they are listed apart.
+    let mut plan = RestorePlan::default();
+    for (change, path) in parse_name_status(&status) {
+        if change == FileChange::Added {
+            plan.kept.push(path);
+        } else {
+            plan.files.push(RestoreFile { path, change });
+        }
+    }
+    Ok(plan)
 }
 
 const DIFF_ARGS: [&str; 6] = [
@@ -1031,11 +1040,14 @@ mod tests {
                 change: FileChange::Modified,
             },
         ];
-        assert_eq!(restore_preview(&sub, &tree).await.unwrap(), expected);
+        let kept = vec!["new.txt".to_string(), "staged.txt".to_string()];
+        let preview = restore_preview(&sub, &tree).await.unwrap();
+        assert_eq!(preview.files, expected);
+        assert_eq!(preview.kept, kept);
         assert_eq!(fs::read(&index_path).unwrap(), index);
         assert!(!sub.join("deleted.txt").exists());
 
-        assert_eq!(restore(&sub, &tree).await.unwrap(), expected);
+        assert_eq!(restore(&sub, &tree).await.unwrap().files, expected);
         for path in ["modified.txt", "deleted.txt"] {
             let text = fs::read_to_string(sub.join(path)).unwrap();
             assert_eq!(text.trim_end(), "original");
@@ -1053,7 +1065,9 @@ mod tests {
             "outside edit\n"
         );
         assert_eq!(fs::read(&index_path).unwrap(), index);
-        assert!(restore_preview(&sub, &tree).await.unwrap().is_empty());
+        let after = restore_preview(&sub, &tree).await.unwrap();
+        assert!(after.files.is_empty());
+        assert_eq!(after.kept, kept);
 
         let commit = text(&repo.0, &["rev-parse", "HEAD"]).await.unwrap();
         assert!(restore_preview(&sub, &commit).await.is_err());
@@ -1075,7 +1089,7 @@ mod tests {
         fs::write(sub.join("[changed].txt"), "edited").unwrap();
 
         assert_eq!(
-            restore_preview(&sub, &tree).await.unwrap(),
+            restore_preview(&sub, &tree).await.unwrap().files,
             [
                 RestoreFile {
                     path: ".gitignore".into(),
@@ -1099,7 +1113,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         fs::write(path.join("new.txt"), "keep").unwrap();
-        let preview = restore_preview(&repo.0, &tree).await.unwrap();
+        let preview = restore_preview(&repo.0, &tree).await.unwrap().files;
         assert_eq!(
             preview,
             [RestoreFile {
