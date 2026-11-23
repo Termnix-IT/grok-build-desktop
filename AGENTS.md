@@ -45,13 +45,21 @@ Grok を起動しない単体テストは次です。
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
+この中の `orchestra/flow_tests.rs` は、Grok Bot と同じく `gbd` のコマンドからジョブを送り、パイプ、エンジン、各エージェントの種類（Claude Code、Codex、Grok、Antigravity、カスタム）を通して、結果と `gbd` での監視を確かめます。エージェントは、起動の仕方、プロンプトの渡し方、出力の形を本物どおりにした偽の CLI です。
+
+本物の CLI で連携の流れを確かめるときは、アプリを起動し、設定の「連携」で受付をオンにしてから次を実行します。登録した各エージェントに小さなジョブを 1 つずつ送るので、それぞれの使用量を使います。確認用のリポジトリ（既定は `%LOCALAPPDATA%\GrokBuildDesktop-flow-check`）は初回に作られます。許可がないと言われたら、そのフォルダを設定の「連携」で許可に足してから流し直します。CLI が出力の形を変えると、偽の CLI のテストは通ったまま本物だけが壊れるので、CLI を更新したあとにも流します。
+
+```powershell
+pwsh -File scripts/check-flow.ps1
+```
+
 画面の確認は Tauri のウィンドウで行います。Vite は `http://localhost:1420` です。`127.0.0.1:1420` は拒否されます。OS のタイトルバーは出さず、ドラッグと最小化、最大化、閉じるは画面内の上端です。WebView の確認に CDP を使うときは、ポートの応答ではなくウィンドウタイトル「Grok Build Desktop」で見ます。
 
 ## 構成
 
 - `src/App.tsx` と `src/App.css` が画面です。チャットの状態の更新は `src/model.ts` の `reduceDesk` に、連携の状態の更新は `src/orchestra.ts` の `reduceOrchestra` に集めます。
 - `src/OrchestraView.tsx` がタスクのジョブのカードとログのドロワー、`src/AgentSettings.tsx` が設定の「エージェント」、`src/GatewaySettings.tsx` が設定の「連携」、`src/MarkdownBody.tsx` が会話とカードで共有する Markdown 表示です。
-- `src-tauri/src/orchestra/` が連携です。`config.rs` が CLI の登録と上限と危険なフラグの検査、`adapter.rs` が起動方法と出力の読み取り、`runner.rs` が子プロセス、`breaker.rs` が失敗の比較、`git.rs` が作業前の記録と差分、`store.rs` が記録の保存、`engine.rs` がキューと止める条件、`ipc.rs` が名前付きパイプ、`cli.rs` が `gbd.exe` の中身です。`src-tauri/src/bin/gbd.rs` は `cli.rs` を呼ぶだけです。テストは各ファイルへ足します。エンジンとパイプのテストは、`testkit.rs` の偽のエージェント（PowerShell のスクリプト）を使います。
+- `src-tauri/src/orchestra/` が連携です。`config.rs` が CLI の登録と上限と危険なフラグの検査、`adapter.rs` が起動方法と出力の読み取り、`runner.rs` が子プロセス、`breaker.rs` が失敗の比較、`git.rs` が作業前の記録と差分、`store.rs` が記録の保存、`engine.rs` がキューと止める条件、`ipc.rs` が名前付きパイプ、`cli.rs` が `gbd.exe` の中身です。`src-tauri/src/bin/gbd.rs` は `cli.rs` を呼ぶだけです。テストは各ファイルへ足します。エンジンとパイプのテストは、`testkit.rs` の偽のエージェント（PowerShell のスクリプト）を使います。`gbd` から各エージェントの種類までを通すテストは `flow_tests.rs` に足します。`scripts/check-flow.ps1` は、起動中のアプリに本物の `gbd.exe` と本物の CLI で流れを確かめるスクリプトで、日本語を含むので BOM 付きの UTF-8 で保存します。
 - `src-tauri/src/agent.rs` が ACP のホストです。公式 crate `agent-client-protocol` 3.4.0 の protocol v1、feature `process` を使います。JSON-RPC の読み取りループは自作しません。
 - `src-tauri/src/usage.rs` が使用量、ファイル URI、添付ブロック、起動中セッションの判定です。テストはここへ足します。
 - `src-tauri/src/permit.rs` が自動承認の判定です。テストはここへ足します。

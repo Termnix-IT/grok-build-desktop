@@ -3,6 +3,8 @@ pub mod breaker;
 pub mod cli;
 pub mod config;
 pub mod engine;
+#[cfg(all(test, windows))]
+mod flow_tests;
 pub mod git;
 pub mod ipc;
 pub mod runner;
