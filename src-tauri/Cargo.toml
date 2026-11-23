@@ -1,6 +1,6 @@
 [package]
 name = "grok-build-desktop"
-version = "0.0.5"
+version = "0.0.6"
 description = "Desktop ACP client for the installed Grok Build"
 authors = ["Termnix-IT"]
 edition = "2024"
