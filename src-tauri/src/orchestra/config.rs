@@ -160,6 +160,12 @@ pub fn defaults() -> Registry {
                     "streaming-json",
                     "--permission-mode",
                     "acceptEdits",
+                    // A headless grok (1.0.92) refuses edits under acceptEdits; these rules
+                    // allow them inside the working folder only.
+                    "--allow",
+                    "Edit(./**)",
+                    "--allow",
+                    "Write(./**)",
                     "--cwd",
                     "{cwd}",
                 ],
