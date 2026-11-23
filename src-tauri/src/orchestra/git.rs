@@ -393,20 +393,27 @@ const TREE_SECS: u64 = 120;
 /// (Git LFS pointers), and only the files git hashes again would lose that, so untouched files
 /// would look changed. Instead the index starts from `HEAD` without file times, and every path
 /// of the real index is hashed again, so a file added with `--force` despite an ignore rule
-/// stays in.
+/// stays in. Entries outside a sparse checkout have no file to hash, so they are copied from
+/// the real index as they are, as the copy would have kept them.
 async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
     let index = repo.run(&["rev-parse", "--git-path", "index"]).await?;
-    let index = repo.dir.join(String::from_utf8_lossy(&index).trim());
+    let index = std::str::from_utf8(&index)
+        .ok()
+        .and_then(|index| index.lines().next())
+        .filter(|index| !index.is_empty())
+        .ok_or("git の index の場所を読み取れませんでした")?;
+    let index = repo.dir.join(index);
     let temp = std::env::temp_dir().join(format!("gbd-index-{}", uuid::Uuid::new_v4()));
     let result = async {
         let env = [("GIT_INDEX_FILE", temp.as_os_str())];
         if !repo.filters_off.is_empty() {
-            let tracked = repo
-                .run_at_top(&["ls-files", "-z"], &[], None, TREE_SECS)
+            let listed = repo
+                .run_at_top(&["ls-files", "-z", "-t", "-s"], &[], None, TREE_SECS)
                 .await?;
+            let tracked = split_tracked(&listed);
             repo.run_with(&["read-tree", "HEAD"], &env, TREE_SECS)
                 .await?;
-            if !tracked.is_empty() {
+            if !tracked.hash.is_empty() {
                 repo.run_at_top(
                     // `--replace`: a file in `HEAD` may be a folder in the index, or the reverse.
                     &[
@@ -418,7 +425,23 @@ async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
                         "--stdin",
                     ],
                     &env,
-                    Some(&tracked),
+                    Some(&tracked.hash),
+                    TREE_SECS,
+                )
+                .await?;
+            }
+            if !tracked.keep.is_empty() {
+                repo.run_at_top(
+                    &["update-index", "-z", "--index-info"],
+                    &env,
+                    Some(&tracked.keep),
+                    TREE_SECS,
+                )
+                .await?;
+                repo.run_at_top(
+                    &["update-index", "--skip-worktree", "-z", "--stdin"],
+                    &env,
+                    Some(&tracked.keep_paths),
                     TREE_SECS,
                 )
                 .await?;
@@ -435,6 +458,46 @@ async fn worktree_tree(repo: &Repo<'_>) -> Result<String, String> {
     let _ = std::fs::remove_file(&temp);
     let _ = std::fs::remove_file(temp.with_extension("lock"));
     result
+}
+
+/// The real index split for [`worktree_tree`], each list NUL-terminated as `update-index -z`
+/// reads it.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Tracked {
+    /// Paths to hash again from the working tree.
+    hash: Vec<u8>,
+    /// Entries outside a sparse checkout, as `mode SP oid SP stage TAB path` for `--index-info`.
+    keep: Vec<u8>,
+    /// The paths of `keep`, to mark skip-worktree again.
+    keep_paths: Vec<u8>,
+}
+
+/// `ls-files -z -t -s` prints `TAG SP mode SP oid SP stage TAB path NUL`, where the tag `S`
+/// marks an entry outside a sparse checkout (skip-worktree).
+fn split_tracked(listed: &[u8]) -> Tracked {
+    let mut tracked = Tracked::default();
+    for entry in listed.split(|b| *b == 0) {
+        let Some((tag, rest)) = entry.split_first() else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(b" ") else {
+            continue;
+        };
+        let Some(tab) = rest.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let path = &rest[tab + 1..];
+        if *tag == b'S' {
+            tracked.keep.extend_from_slice(rest);
+            tracked.keep.push(0);
+            tracked.keep_paths.extend_from_slice(path);
+            tracked.keep_paths.push(0);
+        } else {
+            tracked.hash.extend_from_slice(path);
+            tracked.hash.push(0);
+        }
+    }
+    tracked
 }
 
 /// Records the tree before a step. A merge with unresolved files is refused: the agent
@@ -1032,6 +1095,58 @@ mod tests {
             .map(|file| (file.path.as_str(), file.change))
             .collect();
         assert_eq!(paths, [("p/f", FileChange::Modified)]);
+    }
+
+    #[test]
+    fn splits_sparse_entries_from_the_rest() {
+        let listed =
+            b"H 100644 aaaa 0\ta.txt\0S 100644 bbbb 0\tdir/s t.txt\0M 100644 cccc 2\tm.txt\0";
+        assert_eq!(
+            split_tracked(listed),
+            Tracked {
+                hash: b"a.txt\0m.txt\0".to_vec(),
+                keep: b"100644 bbbb 0\tdir/s t.txt\0".to_vec(),
+                keep_paths: b"dir/s t.txt\0".to_vec(),
+            }
+        );
+        assert_eq!(split_tracked(b""), Tracked::default());
+    }
+
+    /// With a filter switched off, a file outside a sparse checkout stays in the snapshot, and
+    /// bringing it into the working tree during the step is not a change.
+    #[tokio::test]
+    async fn sparse_files_stay_in_the_snapshot() {
+        let Some(repo) = repository().await else {
+            return;
+        };
+        fs::write(repo.0.join("a.txt"), "a\n").unwrap();
+        fs::write(repo.0.join("s.txt"), "s\n").unwrap();
+        commit(&repo.0).await;
+        assert!(
+            git(&repo.0, &["config", "filter.x.clean", "cat"])
+                .await
+                .is_some()
+        );
+        assert!(
+            git(&repo.0, &["update-index", "--skip-worktree", "s.txt"])
+                .await
+                .is_some()
+        );
+        fs::remove_file(repo.0.join("s.txt")).unwrap();
+        let snap = snapshot(&repo.0).await.unwrap();
+        let base = snap.base.clone().unwrap();
+        let names = text(&repo.0, &["ls-tree", "--name-only", &base])
+            .await
+            .unwrap();
+        assert!(names.lines().any(|name| name == "s.txt"));
+        assert!(
+            git(&repo.0, &["update-index", "--no-skip-worktree", "s.txt"])
+                .await
+                .is_some()
+        );
+        assert!(git(&repo.0, &["checkout", "--", "s.txt"]).await.is_some());
+        let found = changes(&repo.0, &snap, 200).await.unwrap();
+        assert_eq!(found.files, []);
     }
 
     #[tokio::test]
