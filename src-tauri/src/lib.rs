@@ -5,10 +5,7 @@ mod usage;
 
 use agent::AgentState;
 use orchestra::{LogLine, Orchestra, Preflight, ProbeResult, Registry, TaskRecord};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
@@ -47,10 +44,7 @@ async fn prompt(
 }
 
 #[tauri::command]
-fn stage_paths(
-    state: State<'_, AgentState>,
-    paths: Vec<String>,
-) -> Vec<agent::AttachmentRecord> {
+fn stage_paths(state: State<'_, AgentState>, paths: Vec<String>) -> Vec<agent::AttachmentRecord> {
     state.stage_paths(paths)
 }
 
@@ -84,11 +78,7 @@ async fn set_mode(state: State<'_, AgentState>, mode_id: String) -> Result<(), S
 }
 
 #[tauri::command]
-async fn set_config(
-    state: State<'_, AgentState>,
-    id: String,
-    value: String,
-) -> Result<(), String> {
+async fn set_config(state: State<'_, AgentState>, id: String, value: String) -> Result<(), String> {
     state.set_config(id, value).await
 }
 
@@ -163,18 +153,67 @@ async fn orchestrator_preflight(app: tauri::AppHandle, project: String) -> Prefl
 }
 
 #[tauri::command]
-async fn orchestrator_start(state: State<'_, Orchestra>, project: String, goal: String) -> Result<String, String> {
-    state.start(PathBuf::from(project), goal).await
+async fn orchestrator_dispatch(
+    app: tauri::AppHandle,
+    project: String,
+    agent_id: String,
+    prompt: String,
+    task_id: Option<String>,
+    title: Option<String>,
+) -> Result<orchestra::engine::Submitted, String> {
+    let state = app.state::<Orchestra>().inner().clone();
+    let job = orchestra::engine::JobSpec {
+        project,
+        agent: agent_id,
+        prompt,
+        title,
+        task_id,
+        timeout_secs: None,
+    };
+    state
+        .submit(job, orchestra::engine::Source::Manual)
+        .await
+        .map_err(|error| error.message)
 }
 
 #[tauri::command]
-fn orchestrator_answer(state: State<'_, Orchestra>, task_id: String, text: String) -> Result<(), String> {
-    state.answer(&task_id, text)
+async fn orchestrator_kill(app: tauri::AppHandle, job_id: String) -> Result<(), String> {
+    let state = app.state::<Orchestra>().inner().clone();
+    state.kill(&job_id).await.map_err(|error| error.message)
 }
 
 #[tauri::command]
-fn orchestrator_abort(state: State<'_, Orchestra>, task_id: String) -> Result<(), String> {
-    state.abort(&task_id)
+async fn orchestrator_cancel(app: tauri::AppHandle, job_id: String) -> Result<(), String> {
+    let state = app.state::<Orchestra>().inner().clone();
+    state
+        .cancel(&job_id, orchestra::engine::Source::Manual)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn orchestrator_stop_all(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Orchestra>().inner().clone();
+    state.stop_all().await.map_err(|error| error.message)
+}
+
+#[tauri::command]
+fn orchestrator_resume(state: State<'_, Orchestra>, task_id: String) -> Result<(), String> {
+    state.resume(&task_id).map_err(|error| error.message)
+}
+
+#[tauri::command]
+async fn orchestrator_close(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    let state = app.state::<Orchestra>().inner().clone();
+    state.close(&task_id).await.map_err(|error| error.message)
+}
+
+#[tauri::command]
+fn orchestrator_resume_project(state: State<'_, Orchestra>, project: String) -> Result<(), String> {
+    state
+        .resume_project(&project)
+        .map_err(|error| error.message)
 }
 
 #[tauri::command]
@@ -202,6 +241,33 @@ fn agent_log(state: State<'_, Orchestra>, node_id: String) -> Vec<LogLine> {
     state.logs(&node_id)
 }
 
+#[tauri::command]
+fn gateway_get(state: State<'_, Orchestra>) -> serde_json::Value {
+    state.gateway_view()
+}
+
+#[tauri::command]
+fn gateway_save(
+    state: State<'_, Orchestra>,
+    accepting: bool,
+    allowed_projects: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    state.gateway_save(accepting, allowed_projects)
+}
+
+/// Runs `gbd version` against the live pipe, the same way Grok Bot will.
+#[tauri::command]
+async fn gateway_selftest() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(orchestra::cli::selftest)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Entry point of the `gbd` console binary.
+pub fn gbd_main() -> i32 {
+    orchestra::cli::main()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -211,13 +277,27 @@ pub fn run() {
         .setup(|app| {
             let state = AgentState::start(app.handle().clone());
             app.manage(state);
+            let config_dir = app.path().app_config_dir()?;
             let orchestra = Orchestra::new(
-                app.path().app_config_dir()?.join("agents.json"),
+                config_dir.join("agents.json"),
+                config_dir.join("gateway.json"),
                 app.path().app_data_dir()?.join("tasks"),
                 Arc::new(orchestra::TauriSink(app.handle().clone())),
-                Arc::new(orchestra::GrokPlanner),
             );
+            let hub = orchestra.clone();
             app.manage(orchestra);
+            tauri::async_runtime::spawn(async move {
+                match orchestra::ipc::pipe_name() {
+                    Ok(pipe) => {
+                        let _ = orchestra::ipc::serve(hub, &pipe).await;
+                    }
+                    Err(error) => {
+                        hub.set_gateway_status(orchestra::engine::GatewayStatus::Failed {
+                            error: error.message,
+                        })
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -246,14 +326,21 @@ pub fn run() {
             agents_config_reset,
             agents_probe,
             orchestrator_preflight,
-            orchestrator_start,
-            orchestrator_answer,
-            orchestrator_abort,
+            orchestrator_dispatch,
+            orchestrator_kill,
+            orchestrator_stop_all,
+            orchestrator_cancel,
+            orchestrator_resume,
+            orchestrator_close,
+            orchestrator_resume_project,
             orchestrator_tasks,
             orchestrator_task,
             orchestrator_delete,
             orchestrator_snapshot,
-            agent_log
+            agent_log,
+            gateway_get,
+            gateway_save,
+            gateway_selftest
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

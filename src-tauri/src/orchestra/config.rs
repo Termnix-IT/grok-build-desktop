@@ -6,21 +6,35 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
     pub version: u32,
-    pub orchestrator: OrchestratorSettings,
+    #[serde(default)]
+    pub limits: Limits,
     pub agents: Vec<AgentSpec>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct OrchestratorSettings {
-    pub max_turns: u32,
+pub struct Limits {
+    pub max_dispatches_per_task: u32,
+    pub max_consecutive_per_project: u32,
     pub same_error_limit: u32,
-    pub dispatch_timeout_secs: u64,
-    pub diff_limit_bytes: usize,
+    pub default_timeout_secs: u64,
+    pub max_queue: usize,
+    pub pause_on_deletion: bool,
     pub log_tail_bytes: usize,
-    pub planner_program: String,
-    pub planner_args: Vec<String>,
-    pub planner_timeout_secs: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_dispatches_per_task: 10,
+            max_consecutive_per_project: 30,
+            same_error_limit: 2,
+            default_timeout_secs: 1200,
+            max_queue: 20,
+            pause_on_deletion: true,
+            log_tail_bytes: 4096,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -36,6 +50,8 @@ pub struct AgentSpec {
     pub output: OutputFormat,
     pub role: String,
     pub allow_dangerous: bool,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +79,7 @@ pub enum OutputFormat {
     ClaudeStreamJson,
     CodexJsonl,
     GrokJson,
+    AntigravityJson,
 }
 
 pub fn defaults() -> Registry {
@@ -85,19 +102,11 @@ pub fn defaults() -> Registry {
         output,
         role: role.into(),
         allow_dangerous: false,
+        timeout_secs: None,
     };
     Registry {
         version: 1,
-        orchestrator: OrchestratorSettings {
-            max_turns: 10,
-            same_error_limit: 2,
-            dispatch_timeout_secs: 1200,
-            diff_limit_bytes: 16384,
-            log_tail_bytes: 4096,
-            planner_program: "grok".into(),
-            planner_args: vec![],
-            planner_timeout_secs: 600,
-        },
+        limits: Limits::default(),
         agents: vec![
             agent(
                 "claude",
@@ -156,25 +165,57 @@ pub fn defaults() -> Registry {
                 ],
                 PromptVia::File,
                 OutputFormat::GrokJson,
-                "コードベースの調査、小さな修正、別の視点からのレビューが得意。",
+                "コードベースの調査、小さな修正、別の視点からのレビューが得意。読み取りだけのコマンドは実行でき、ファイルを消すなどのコマンドは自動で拒否される。",
             ),
             agent(
                 "antigravity",
                 "Antigravity",
                 AgentKind::Antigravity,
-                false,
+                true,
                 "agy",
-                &["-p", "{prompt}"],
+                &[
+                    "--output-format",
+                    "json",
+                    "--mode",
+                    "accept-edits",
+                    "--sandbox",
+                    "-p={prompt}",
+                ],
                 PromptVia::Arg,
-                OutputFormat::Text,
-                "Google の Antigravity CLI。版によってフラグが違うため、既定では無効。",
+                OutputFormat::AntigravityJson,
+                "Google の Antigravity CLI。ファイルの編集ができる。シェルのコマンドは自動で拒否される。",
             ),
         ],
     }
 }
 
 pub fn dangerous_flag(args: &[String]) -> Option<String> {
-    // Substrings also catch values nested in -c key="value" or JSON passed to --settings.
+    for (index, arg) in args.iter().enumerate() {
+        let normalized = decode_json_escapes(arg);
+        let next = args.get(index + 1).map(|value| decode_json_escapes(value));
+        for candidate in [arg.as_str(), normalized.as_str()] {
+            if dangerous_value(candidate, next.as_deref()) {
+                return Some(arg.clone());
+            }
+            for json in [
+                Some(candidate),
+                candidate.split_once('=').map(|(_, value)| value),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
+                    && dangerous_json(&value)
+                {
+                    return Some(arg.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn dangerous_value(text: &str, next: Option<&str>) -> bool {
     const MARKERS: &[&str] = &[
         "dangerously-",
         "--yolo",
@@ -182,36 +223,82 @@ pub fn dangerous_flag(args: &[String]) -> Option<String> {
         "bypasspermissions",
         "danger-full-access",
     ];
-    for (index, arg) in args.iter().enumerate() {
-        let lower = arg.to_ascii_lowercase();
-        let (flag, value) = lower
-            .split_once('=')
-            .map_or((lower.as_str(), None), |(flag, value)| (flag, Some(value)));
-        if MARKERS.iter().any(|marker| lower.contains(marker))
-            || [Some(flag), value]
-                .into_iter()
-                .flatten()
-                .any(|part| part.trim_matches(['"', '\'']) == "yolo")
-            || (flag == "--approve"
-                && (value == Some("all")
-                    || (value.is_none()
-                        && args
-                            .get(index + 1)
-                            .is_some_and(|next| next.eq_ignore_ascii_case("all")))))
-        {
-            return Some(arg.clone());
-        }
+    let lower = text.to_ascii_lowercase();
+    let (flag, value) = lower
+        .split_once('=')
+        .map_or((lower.as_str(), None), |(flag, value)| (flag, Some(value)));
+    MARKERS.iter().any(|marker| lower.contains(marker))
+        || [Some(flag), value]
+            .into_iter()
+            .flatten()
+            .any(|part| part.trim_matches(['"', '\'']) == "yolo")
+        || (flag == "--approve"
+            && (value == Some("all")
+                || (value.is_none() && next.is_some_and(|next| next.eq_ignore_ascii_case("all")))))
+}
+
+fn dangerous_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => dangerous_value(&decode_json_escapes(text), None),
+        serde_json::Value::Array(values) => values.iter().any(dangerous_json),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            dangerous_value(&decode_json_escapes(key), None) || dangerous_json(value)
+        }),
+        _ => false,
     }
-    None
+}
+
+fn decode_json_escapes(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with("\\/") {
+            output.push('/');
+            rest = &rest[2..];
+            continue;
+        }
+        if rest.starts_with("\\u") {
+            // serde also validates UTF-16 surrogate pairs; malformed escapes remain literal.
+            let mut consumed = false;
+            for length in [12, 6] {
+                if let Some(escape) = rest.get(..length)
+                    && let Ok(decoded) = serde_json::from_str::<String>(&format!("\"{escape}\""))
+                {
+                    output.push_str(&decoded);
+                    rest = &rest[length..];
+                    consumed = true;
+                    break;
+                }
+            }
+            if consumed {
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("nonempty text");
+        output.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    output
 }
 
 pub fn validate(registry: &Registry) -> Result<(), String> {
     if registry.version != 1 {
         return Err("version は 1 にしてください".into());
     }
-    let settings = &registry.orchestrator;
+    let settings = &registry.limits;
     for (name, value, min, max) in [
-        ("maxTurns", u64::from(settings.max_turns), 1, 50),
+        (
+            "maxDispatchesPerTask",
+            u64::from(settings.max_dispatches_per_task),
+            1,
+            100,
+        ),
+        (
+            "maxConsecutivePerProject",
+            u64::from(settings.max_consecutive_per_project),
+            1,
+            500,
+        ),
         (
             "sameErrorLimit",
             u64::from(settings.same_error_limit),
@@ -219,60 +306,17 @@ pub fn validate(registry: &Registry) -> Result<(), String> {
             10,
         ),
         (
-            "dispatchTimeoutSecs",
-            settings.dispatch_timeout_secs,
+            "defaultTimeoutSecs",
+            settings.default_timeout_secs,
             30,
             7200,
         ),
-        (
-            "diffLimitBytes",
-            settings.diff_limit_bytes as u64,
-            1024,
-            262144,
-        ),
+        ("maxQueue", settings.max_queue as u64, 1, 100),
         ("logTailBytes", settings.log_tail_bytes as u64, 256, 65536),
-        (
-            "plannerTimeoutSecs",
-            settings.planner_timeout_secs,
-            30,
-            3600,
-        ),
     ] {
         if !(min..=max).contains(&value) {
             return Err(format!(
-                "orchestrator.{name} は {min}〜{max} の範囲にしてください"
-            ));
-        }
-    }
-    if settings.planner_program.trim().is_empty() {
-        return Err("orchestrator.plannerProgram を入力してください".into());
-    }
-    validate_args("orchestrator.plannerArgs", &settings.planner_args, 32)?;
-    if let Some(flag) = dangerous_flag(&settings.planner_args) {
-        return Err(format!(
-            "orchestrator.plannerArgs に危険な指定「{flag}」は使えません"
-        ));
-    }
-    const RESERVED: &[&str] = &[
-        "--permission-mode",
-        "--always-approve",
-        "--json-schema",
-        "--output-format",
-        "--prompt-file",
-        "-p",
-        "--single",
-        "-s",
-        "--session-id",
-        "-r",
-        "--resume",
-        "--cwd",
-        "--rules",
-    ];
-    for arg in &settings.planner_args {
-        let lower = arg.to_ascii_lowercase();
-        if RESERVED.contains(&lower.split('=').next().unwrap_or_default()) {
-            return Err(format!(
-                "orchestrator.plannerArgs の「{arg}」はアプリが指定するため使えません"
+                "limits.{name} は {min}〜{max} の範囲にしてください"
             ));
         }
     }
@@ -304,6 +348,13 @@ pub fn validate(registry: &Registry) -> Result<(), String> {
         }
         if agent.role.chars().count() > 400 {
             return Err(format!("{item}.role は 400 文字以下にしてください"));
+        }
+        if let Some(timeout) = agent.timeout_secs
+            && !(30..=7200).contains(&timeout)
+        {
+            return Err(format!(
+                "{item}.timeoutSecs は 30〜7200 の範囲にしてください"
+            ));
         }
         validate_args(&format!("{item}.args"), &agent.args, 64)?;
         let prompt = agent.args.iter().any(|arg| arg.contains("{prompt}"));
@@ -432,10 +483,30 @@ mod tests {
         let registry = defaults();
         assert!(validate(&registry).is_ok());
         let value = serde_json::to_value(&registry).unwrap();
-        assert_eq!(value["orchestrator"]["maxTurns"], 10);
+        assert_eq!(value["limits"]["maxDispatchesPerTask"], 10);
         assert_eq!(value["agents"][0]["promptVia"], "stdin");
         assert_eq!(value["agents"][0]["allowDangerous"], false);
         assert_eq!(value["agents"][0]["output"], "claudeStreamJson");
+        assert_eq!(value["agents"][3]["enabled"], true);
+        assert_eq!(value["agents"][3]["output"], "antigravityJson");
+        assert_eq!(
+            value["agents"][3]["args"],
+            serde_json::json!([
+                "--output-format",
+                "json",
+                "--mode",
+                "accept-edits",
+                "--sandbox",
+                "-p={prompt}"
+            ])
+        );
+        assert_eq!(registry.limits, Limits::default());
+        let mut old = value;
+        old.as_object_mut().unwrap().remove("limits");
+        for agent in old["agents"].as_array_mut().unwrap() {
+            agent.as_object_mut().unwrap().remove("timeoutSecs");
+        }
+        assert_eq!(serde_json::from_value::<Registry>(old).unwrap(), registry);
     }
 
     #[test]
@@ -459,6 +530,12 @@ mod tests {
             ],
             vec!["--approval-mode", "yolo"],
             vec!["--approval-mode='yolo'"],
+            vec![
+                "--settings",
+                r#"{"permissions":{"defaultMode":"bypass\u0050ermissions"}}"#,
+            ],
+            vec![r#"--settings={"sandbox":"danger\u002dfull\u002daccess"}"#],
+            vec![r#"{"\u0062ypassPermissions":true}"#],
         ] {
             let args = strings(&args);
             assert!(dangerous_flag(&args).is_some(), "{args:?}");
@@ -467,8 +544,6 @@ mod tests {
             assert!(validate(&registry).is_err(), "{args:?}");
             registry.agents[0].allow_dangerous = true;
             assert!(validate(&registry).is_ok(), "{args:?}");
-            registry.orchestrator.planner_args = args;
-            assert!(validate(&registry).is_err());
         }
         assert!(
             dangerous_flag(&strings(&[
@@ -479,31 +554,7 @@ mod tests {
             ]))
             .is_none()
         );
-    }
-
-    #[test]
-    fn planner_reserved_flags_are_always_rejected() {
-        for flag in [
-            "--permission-mode",
-            "--always-approve",
-            "--json-schema",
-            "--output-format",
-            "--prompt-file",
-            "-p",
-            "--single",
-            "-s",
-            "--session-id",
-            "-r",
-            "--resume",
-            "--cwd",
-            "--rules",
-        ] {
-            for arg in [flag.to_owned(), format!("{flag}=value")] {
-                let mut registry = defaults();
-                registry.orchestrator.planner_args = vec![arg];
-                assert!(validate(&registry).is_err(), "{flag}");
-            }
-        }
+        assert!(dangerous_flag(&strings(&["--permission-mode", "auto"])).is_none());
     }
 
     #[test]
@@ -550,15 +601,19 @@ mod tests {
     fn validates_lengths_and_numeric_bounds() {
         let invalid: Vec<Box<dyn Fn(&mut Registry)>> = vec![
             Box::new(|r| r.version = 2),
-            Box::new(|r| r.orchestrator.max_turns = 0),
-            Box::new(|r| r.orchestrator.same_error_limit = 11),
-            Box::new(|r| r.orchestrator.dispatch_timeout_secs = 29),
-            Box::new(|r| r.orchestrator.diff_limit_bytes = 262145),
-            Box::new(|r| r.orchestrator.log_tail_bytes = 255),
-            Box::new(|r| r.orchestrator.planner_timeout_secs = 3601),
-            Box::new(|r| r.orchestrator.planner_program = " ".into()),
-            Box::new(|r| r.orchestrator.planner_args = vec!["x".into(); 33]),
-            Box::new(|r| r.orchestrator.planner_args = vec!["あ".repeat(4097)]),
+            Box::new(|r| r.limits.max_dispatches_per_task = 0),
+            Box::new(|r| r.limits.max_dispatches_per_task = 101),
+            Box::new(|r| r.limits.max_consecutive_per_project = 0),
+            Box::new(|r| r.limits.max_consecutive_per_project = 501),
+            Box::new(|r| r.limits.max_queue = 0),
+            Box::new(|r| r.limits.max_queue = 101),
+            Box::new(|r| r.limits.same_error_limit = 0),
+            Box::new(|r| r.limits.same_error_limit = 11),
+            Box::new(|r| r.limits.default_timeout_secs = 29),
+            Box::new(|r| r.limits.default_timeout_secs = 7201),
+            Box::new(|r| r.agents[0].timeout_secs = Some(29)),
+            Box::new(|r| r.agents[0].timeout_secs = Some(7201)),
+            Box::new(|r| r.limits.log_tail_bytes = 255),
             Box::new(|r| r.agents = vec![r.agents[0].clone(); 17]),
             Box::new(|r| r.agents[0].name.clear()),
             Box::new(|r| r.agents[0].name = "あ".repeat(41)),
@@ -575,6 +630,22 @@ mod tests {
         let mut empty = defaults();
         empty.agents.clear();
         assert!(validate(&empty).is_ok());
+        let mut edges = defaults();
+        for (dispatches, consecutive, errors, timeout, queue, tail) in
+            [(1, 1, 1, 30, 1, 256), (100, 500, 10, 7200, 100, 65536)]
+        {
+            edges.limits = Limits {
+                max_dispatches_per_task: dispatches,
+                max_consecutive_per_project: consecutive,
+                same_error_limit: errors,
+                default_timeout_secs: timeout,
+                max_queue: queue,
+                pause_on_deletion: false,
+                log_tail_bytes: tail,
+            };
+            edges.agents[0].timeout_secs = Some(timeout);
+            assert!(validate(&edges).is_ok());
+        }
     }
 
     #[test]
@@ -608,11 +679,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gbd-config-{}", uuid::Uuid::new_v4()));
         let path = dir.join("nested").join("agents.json");
         let mut registry = defaults();
-        registry.orchestrator.max_turns = 23;
+        registry.limits.max_dispatches_per_task = 23;
         assert_eq!(load(&path), defaults());
         save(&path, &registry).unwrap();
         assert_eq!(load(&path), registry);
-        registry.orchestrator.max_turns = 24;
+        registry.limits.max_dispatches_per_task = 24;
         save(&path, &registry).unwrap();
         assert_eq!(load(&path), registry);
         fs::write(&path, "broken").unwrap();

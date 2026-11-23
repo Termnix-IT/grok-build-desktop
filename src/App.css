@@ -882,6 +882,7 @@ button:disabled:hover { background: transparent; }
 .badge.done { background: var(--good); }
 .badge.error { background: var(--danger); }
 .badge.ask { background: transparent; box-shadow: inset 0 0 0 2px var(--accent); }
+.badge.wait { background: transparent; box-shadow: inset 0 0 0 2px #6a6a6a; }
 .badge.spin {
   background: transparent;
   border: 2px solid rgba(76, 154, 255, 0.25);
@@ -932,10 +933,7 @@ button:disabled:hover { background: transparent; }
   content-visibility: auto;
   contain-intrinsic-size: auto 120px;
 }
-.flow-card.complete { border-color: rgba(61, 204, 138, 0.4); }
-.flow-card.askHuman { border-color: rgba(76, 154, 255, 0.45); }
 .flow-card.fail { border-color: rgba(240, 113, 103, 0.45); }
-.flow-card.thinking { color: var(--muted); }
 .flow-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .flow-head strong {
   min-width: 0;
@@ -945,7 +943,7 @@ button:disabled:hover { background: transparent; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.flow-turn, .flow-meta {
+.flow-meta {
   flex: none;
   color: var(--faint);
   font-size: 12px;
@@ -976,8 +974,6 @@ button:disabled:hover { background: transparent; }
   padding: 10px;
   font-size: 12px;
 }
-.flow-route { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
-.flow-arrow { color: var(--faint); }
 .agent-chip {
   height: 20px;
   flex: none;
@@ -1011,7 +1007,6 @@ button:disabled:hover { background: transparent; }
   white-space: pre-wrap;
   word-break: break-word;
 }
-.flow-run { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
 .flow-result { max-height: 320px; margin-top: 6px; overflow: auto; font-size: 13.5px; line-height: 1.6; }
 .flow-diff {
   margin: 8px 0 0;
@@ -1023,9 +1018,66 @@ button:disabled:hover { background: transparent; }
   font-size: 12px;
 }
 .flow-files { list-style: none; margin: 6px 0 0; padding: 0; }
-.flow-files .path { margin: 2px 0; color: var(--good); }
+.flow-files .path { display: flex; align-items: baseline; gap: 8px; margin: 2px 0; font-size: 12.5px; }
+.file-mark {
+  width: 1.2em;
+  flex: none;
+  font-family: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  font-weight: 650;
+  color: var(--muted);
+}
+.flow-files .added .file-mark,
+.flow-files .untracked .file-mark { color: var(--good); }
+.flow-files .deleted .file-mark { color: var(--danger); }
+.flow-files .renamed .file-mark { color: var(--accent); }
+.file-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+}
+.file-count {
+  flex: none;
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+  font-family: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+}
+.file-count .plus { color: var(--good); }
+.file-count .minus { color: var(--danger); }
 .flow-error { margin: 8px 0 0; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
 .notice.warn { border-color: rgba(240, 113, 103, 0.45); }
+.flow-task { display: flex; align-items: center; gap: 8px; min-width: 0; margin: 0 0 12px; }
+.flow-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.source-chip {
+  height: 20px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 4px;
+  background: #2a2a2a;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.source-chip.bot { color: var(--accent); }
+.flow-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 6px; font-size: 12.5px; }
+.flow-actions { display: inline-flex; gap: 6px; margin-left: auto; }
+.flow-stop .flow-actions { display: flex; margin: 8px 0 0; }
+.pill.danger { background: transparent; }
+.pill.danger:hover { background: rgba(240, 113, 103, 0.12); }
+.flow-denied { margin: 0.2em 0 0; padding-left: 1.2em; color: #f3a59e; font-size: 12.5px; word-break: break-word; }
+.flow-recovery { display: flex; align-items: center; gap: 8px; margin: 8px 0 0; }
+.flow-recovery .flow-log { margin-left: 0; }
 
 .log-drawer {
   flex: 0 0 38%;
@@ -1088,12 +1140,17 @@ button:disabled:hover { background: transparent; }
 .loop-stop .stop-mark { width: 9px; height: 9px; background: var(--danger); }
 .loop-stop:hover { background: rgba(240, 113, 103, 0.12); }
 .meta-left { display: flex; align-items: center; gap: 14px; min-width: 0; }
-.flow-indicator { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.flow-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
 .flow-indicator[data-status="running"] { color: var(--text); }
-.flow-indicator[data-status="waiting"],
-.flow-indicator[data-status="paused"] { color: var(--accent); }
-.flow-indicator[data-status="completed"] { color: var(--good); }
-.flow-indicator[data-status="error"] { color: var(--danger); }
 .flow-turns { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 .agent-grid {
@@ -1151,3 +1208,31 @@ button:disabled:hover { background: transparent; }
 }
 
 * { scrollbar-width: thin; scrollbar-color: #3a3a3a transparent; }
+
+.plain-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.gateway-folder { align-items: baseline; }
+.gateway-folder strong { flex: none; font-weight: 600; }
+.gateway-folder code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.gateway-path { display: block; color: var(--text); font-size: 12px; word-break: break-all; }
+.gateway-usage {
+  max-height: 220px;
+  margin: 8px 0 0;
+  overflow: auto;
+  padding: 10px;
+  background: #141414;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+.gateway-rejections { list-style: none; margin: 0; padding: 0; }
+.gateway-rejections li { display: flex; align-items: center; gap: 8px; min-height: 26px; font-size: 12.5px; }
+.gateway-rejections code { color: var(--muted); font-size: 11.5px; }

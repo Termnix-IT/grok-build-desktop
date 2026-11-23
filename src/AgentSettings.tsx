@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   type AgentSpec,
-  type OrchestratorSettings,
+  type Limits,
   type OutputFormat,
   type ProbeResult,
   type PromptVia,
@@ -13,15 +13,17 @@ import {
 } from "./orchestra";
 
 const PROMPT_VIAS: PromptVia[] = ["stdin", "arg", "file"];
-const OUTPUTS: OutputFormat[] = ["text", "claudeStreamJson", "codexJsonl", "grokJson"];
+const OUTPUTS: OutputFormat[] = ["text", "claudeStreamJson", "codexJsonl", "grokJson", "antigravityJson"];
 
-const NUMBER_FIELDS: { key: keyof OrchestratorSettings; label: string }[] = [
-  { key: "maxTurns", label: "最大ターン" },
+type NumberLimit = Exclude<keyof Limits, "pauseOnDeletion">;
+
+const NUMBER_FIELDS: { key: NumberLimit; label: string }[] = [
+  { key: "maxDispatchesPerTask", label: "1 タスクのジョブ" },
+  { key: "maxConsecutivePerProject", label: "Grok Bot の連続実行" },
   { key: "sameErrorLimit", label: "同じ失敗で止める回数" },
-  { key: "dispatchTimeoutSecs", label: "1 回の上限（秒）" },
-  { key: "plannerTimeoutSecs", label: "判断の上限（秒）" },
-  { key: "diffLimitBytes", label: "Grok に返す差分（バイト）" },
-  { key: "logTailBytes", label: "Grok に返す stderr（バイト）" },
+  { key: "defaultTimeoutSecs", label: "1 回の上限（秒）" },
+  { key: "maxQueue", label: "待ちの数" },
+  { key: "logTailBytes", label: "Grok Bot に返す stderr（バイト）" },
 ];
 
 function errorText(error: unknown) {
@@ -48,8 +50,8 @@ export function AgentSettings({
   if (!draft) return <p className="note">読み込み中</p>;
   const dirty = JSON.stringify(draft) !== JSON.stringify(registry);
 
-  function patchOrchestrator(change: Partial<OrchestratorSettings>) {
-    setDraft((current) => (current ? { ...current, orchestrator: { ...current.orchestrator, ...change } } : current));
+  function patchLimits(change: Partial<Limits>) {
+    setDraft((current) => (current ? { ...current, limits: { ...current.limits, ...change } } : current));
     setNote("");
   }
 
@@ -101,9 +103,10 @@ export function AgentSettings({
   }
 
   return (
-    <>
+    // Editing stays locked while a save is pending, so no edit is overwritten by the saved copy.
+    <fieldset className="plain-fieldset" disabled={busy}>
       <div className="settings-frame">
-        <h3>司令塔</h3>
+        <h3>上限</h3>
         <div className="agent-grid">
           {NUMBER_FIELDS.map((field) => (
             <label key={field.key} className="field">
@@ -111,24 +114,22 @@ export function AgentSettings({
               <input
                 type="number"
                 inputMode="numeric"
-                value={String(draft.orchestrator[field.key])}
-                onChange={(event) => patchOrchestrator({ [field.key]: Number(event.target.value) } as Partial<OrchestratorSettings>)}
+                value={String(draft.limits[field.key])}
+                onChange={(event) => patchLimits({ [field.key]: Number(event.target.value) } as Partial<Limits>)}
               />
             </label>
           ))}
-          <label className="field wide">
-            <span>プログラム</span>
-            <input
-              value={draft.orchestrator.plannerProgram}
-              spellCheck={false}
-              onChange={(event) => patchOrchestrator({ plannerProgram: event.target.value })}
-            />
-          </label>
-          <label className="field wide">
-            <span>追加の引数</span>
-            <LinesField value={draft.orchestrator.plannerArgs} onChange={(plannerArgs) => patchOrchestrator({ plannerArgs })} />
-          </label>
         </div>
+        <button
+          type="button"
+          role="checkbox"
+          aria-checked={draft.limits.pauseOnDeletion}
+          className="view-option"
+          onClick={() => patchLimits({ pauseOnDeletion: !draft.limits.pauseOnDeletion })}
+        >
+          <span className="quiet-check" aria-hidden="true">{draft.limits.pauseOnDeletion ? "✓" : ""}</span>
+          追跡中のファイルが消えたら一時停止
+        </button>
       </div>
 
       {draft.agents.map((agent) => {
@@ -180,6 +181,20 @@ export function AgentSettings({
                   value={agent.program}
                   spellCheck={false}
                   onChange={(event) => patchAgent(agent.id, { program: event.target.value })}
+                />
+              </label>
+              <label className="field">
+                <span>1 回の上限（秒）</span>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  placeholder={String(draft.limits.defaultTimeoutSecs)}
+                  value={agent.timeoutSecs == null ? "" : String(agent.timeoutSecs)}
+                  onChange={(event) =>
+                    patchAgent(agent.id, {
+                      timeoutSecs: event.target.value.trim() === "" ? null : Number(event.target.value),
+                    })
+                  }
                 />
               </label>
               <label className="field wide">
@@ -243,7 +258,7 @@ export function AgentSettings({
         </button>
       </div>
       {note && <p className="settings-copy">{note}</p>}
-    </>
+    </fieldset>
   );
 }
 

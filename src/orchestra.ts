@@ -1,56 +1,59 @@
-export type TaskStatus = "running" | "waiting" | "paused" | "completed" | "error" | "aborted";
-export type NodeStatus = "running" | "succeeded" | "failed" | "killed" | "timedOut";
-export type NextAction = "dispatch" | "complete" | "askHuman";
+export type TaskStatus = "open" | "paused" | "closed";
+export type RunStatus = "queued" | "running" | "succeeded" | "failed" | "killed" | "timedOut" | "cancelled";
+export type Source = "bot" | "manual";
+export type ErrorKind = "exit" | "timeout" | "killed" | "launch" | "denied" | "interrupted" | "cancelled";
+export type FileChange = "modified" | "added" | "deleted" | "renamed" | "untracked";
 export type LogStream = "stdout" | "stderr" | "system";
 export type AgentKind = "claude" | "codex" | "grok" | "antigravity" | "custom";
 export type PromptVia = "stdin" | "arg" | "file";
-export type OutputFormat = "text" | "claudeStreamJson" | "codexJsonl" | "grokJson";
+export type OutputFormat = "text" | "claudeStreamJson" | "codexJsonl" | "grokJson" | "antigravityJson";
 
-export interface Decision {
-  nextAction: NextAction;
-  reasoning: string;
-  targetAgent?: string | null;
-  convertedPrompt?: string | null;
-  stepTitle?: string | null;
-  question?: string | null;
-  summary?: string | null;
+export interface ChangedFile {
+  path: string;
+  change: FileChange;
+  added?: number | null;
+  deleted?: number | null;
+}
+
+export interface RunError {
+  kind: ErrorKind;
+  message: string;
 }
 
 export interface RunRecord {
+  id: string;
+  taskId: string;
   agentId: string;
-  nodeId: string;
-  status: NodeStatus;
-  startedAt: number;
+  source: Source;
+  title: string;
+  prompt: string;
+  status: RunStatus;
+  queuedAt: number;
+  startedAt?: number | null;
   endedAt?: number | null;
+  timeoutSecs: number;
   exitCode?: number | null;
   summary: string;
+  error?: RunError | null;
+  denied: string[];
   diffStat: string;
-  untracked: string[];
-}
-
-export interface Step {
-  id: string;
-  turn: number;
-  planNodeId: string;
-  decision?: Decision | null;
-  error?: string | null;
-  run?: RunRecord | null;
-  reply?: string | null;
+  changedFiles: ChangedFile[];
+  truncated: boolean;
+  recoveryPoint?: string | null;
 }
 
 export interface TaskRecord {
   id: string;
   project: string;
-  goal: string;
+  title: string;
+  source: Source;
   createdAt: number;
   updatedAt: number;
   status: TaskStatus;
-  reason?: string | null;
-  turn: number;
-  maxTurns: number;
-  plannerSession: string;
-  plannerStarted: boolean;
-  steps: Step[];
+  pauseReason?: string | null;
+  dispatches: number;
+  dispatchLimit: number;
+  runs: RunRecord[];
 }
 
 export interface LogLine {
@@ -70,22 +73,22 @@ export interface AgentSpec {
   output: OutputFormat;
   role: string;
   allowDangerous: boolean;
+  timeoutSecs?: number | null;
 }
 
-export interface OrchestratorSettings {
-  maxTurns: number;
+export interface Limits {
+  maxDispatchesPerTask: number;
+  maxConsecutivePerProject: number;
   sameErrorLimit: number;
-  dispatchTimeoutSecs: number;
-  diffLimitBytes: number;
+  defaultTimeoutSecs: number;
+  maxQueue: number;
+  pauseOnDeletion: boolean;
   logTailBytes: number;
-  plannerProgram: string;
-  plannerArgs: string[];
-  plannerTimeoutSecs: number;
 }
 
 export interface Registry {
   version: number;
-  orchestrator: OrchestratorSettings;
+  limits: Limits;
   agents: AgentSpec[];
 }
 
@@ -96,50 +99,110 @@ export interface ProbeResult {
   error?: string | null;
 }
 
-export interface Preflight {
-  isGit: boolean;
-  hasCommit: boolean;
-  dirty: boolean;
-  branch?: string | null;
+export type GatewayStatus =
+  | { state: "starting" }
+  | { state: "listening"; pipe: string }
+  | { state: "failed"; error: string };
+
+export interface Rejection {
+  project: string;
+  agent: string;
+  code: string;
+  at: number;
 }
 
-export interface Planning {
-  stepId: string;
-  nodeId: string;
-  turn: number;
+export interface GatewayView {
+  accepting: boolean;
+  allowedProjects: string[];
+  status: GatewayStatus;
+  pipe?: string | null;
+  cliPath?: string | null;
+}
+
+export interface Submitted {
+  jobId: string;
+  taskId: string;
+  position: number;
+}
+
+export interface HubSnapshot {
+  running?: string | null;
+  queued?: string[];
+  active?: TaskRecord[];
+  gateway?: { status: GatewayStatus; accepting: boolean };
+}
+
+export interface GatewayState {
+  status: GatewayStatus | null;
+  accepting: boolean;
+  rejections: Rejection[];
 }
 
 export interface OrchestraState {
   tasks: Record<string, TaskRecord>;
   activeTaskId: string | null;
-  planning: Record<string, Planning>;
+  /** When this screen last heard about each task, so an older list cannot overwrite it. */
+  touched: Record<string, number>;
   logs: Record<string, LogLine[]>;
+  logOrder: string[];
+  gateway: GatewayState;
 }
 
 export const initialOrchestra: OrchestraState = {
   tasks: {},
   activeTaskId: null,
-  planning: {},
+  touched: {},
   logs: {},
+  logOrder: [],
+  gateway: { status: null, accepting: false, rejections: [] },
 };
 
 const LOG_LIMIT = 2000;
+const LOG_NODES = 50;
+const REJECTIONS = 5;
 
 export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
-  running: "自律実行中",
-  waiting: "承認待ち",
+  open: "進行中",
   paused: "一時停止",
-  completed: "完了確認",
-  error: "エラー",
-  aborted: "停止済み",
+  closed: "終了",
 };
 
-export const NODE_STATUS_LABEL: Record<NodeStatus, string> = {
+export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
+  queued: "待機中",
   running: "実行中",
   succeeded: "完了",
   failed: "失敗",
   killed: "強制終了",
   timedOut: "時間切れ",
+  cancelled: "取り消し",
+};
+
+export const SOURCE_LABEL: Record<Source, string> = {
+  bot: "Grok Bot",
+  manual: "画面",
+};
+
+export const ERROR_KIND_LABEL: Record<ErrorKind, string> = {
+  exit: "異常終了",
+  timeout: "時間切れ",
+  killed: "強制終了",
+  launch: "起動の失敗",
+  denied: "操作の拒否",
+  interrupted: "中断",
+  cancelled: "取り消し",
+};
+
+export const FILE_CHANGE_MARK: Record<FileChange, { mark: string; label: string }> = {
+  modified: { mark: "M", label: "変更" },
+  added: { mark: "A", label: "追加" },
+  deleted: { mark: "D", label: "削除" },
+  renamed: { mark: "R", label: "名前の変更" },
+  untracked: { mark: "U", label: "新規" },
+};
+
+export const REJECTION_LABEL: Record<string, string> = {
+  project_not_allowed: "許可していないプロジェクト",
+  project_paused: "連続実行の上限",
 };
 
 export const PROMPT_VIA_LABEL: Record<PromptVia, string> = {
@@ -153,41 +216,43 @@ export const OUTPUT_LABEL: Record<OutputFormat, string> = {
   claudeStreamJson: "Claude stream-json",
   codexJsonl: "Codex JSONL",
   grokJson: "Grok JSON",
+  antigravityJson: "Antigravity JSON",
 };
 
-export type Badge = "spin" | "done" | "error" | "ask" | "stop";
+export type Badge = "spin" | "wait" | "done" | "error" | "ask" | "stop";
 
-export function isLive(status: TaskStatus) {
-  return status === "running" || status === "waiting" || status === "paused";
-}
-
-export function taskBadge(status: TaskStatus): Badge {
+export function runBadge(status: RunStatus): Badge {
   switch (status) {
-    case "running":
-      return "spin";
-    case "waiting":
-    case "paused":
-      return "ask";
-    case "completed":
-      return "done";
-    case "error":
-      return "error";
-    default:
-      return "stop";
-  }
-}
-
-export function nodeBadge(status: NodeStatus): Badge {
-  switch (status) {
+    case "queued":
+      return "wait";
     case "running":
       return "spin";
     case "succeeded":
       return "done";
-    case "killed":
-      return "stop";
-    default:
+    case "failed":
+    case "timedOut":
       return "error";
+    default:
+      return "stop";
   }
+}
+
+export function runFinished(status: RunStatus) {
+  return status !== "queued" && status !== "running";
+}
+
+export function taskActive(task: TaskRecord) {
+  return task.runs.some((run) => !runFinished(run.status));
+}
+
+export function taskBadge(task: TaskRecord): { badge: Badge; label: string } {
+  if (task.runs.some((run) => run.status === "running")) return { badge: "spin", label: RUN_STATUS_LABEL.running };
+  if (task.runs.some((run) => run.status === "queued")) return { badge: "wait", label: RUN_STATUS_LABEL.queued };
+  if (task.status === "paused") return { badge: "ask", label: TASK_STATUS_LABEL.paused };
+  const last = task.runs[task.runs.length - 1];
+  if (task.status === "closed") return { badge: last?.status === "succeeded" ? "done" : "stop", label: TASK_STATUS_LABEL.closed };
+  if (!last) return { badge: "wait", label: TASK_STATUS_LABEL.open };
+  return { badge: runBadge(last.status), label: RUN_STATUS_LABEL[last.status] };
 }
 
 export function agentName(agents: AgentSpec[], id: string | null | undefined) {
@@ -195,22 +260,8 @@ export function agentName(agents: AgentSpec[], id: string | null | undefined) {
   return agents.find((agent) => agent.id === id)?.name || id;
 }
 
-export function stepLabel(step: Step, agents: AgentSpec[]): { who: string; what: string; badge: Badge } {
-  const decision = step.decision;
-  if (!decision) {
-    return { who: "Grok", what: step.error ? "判断の失敗" : "判断", badge: step.error ? "error" : "spin" };
-  }
-  if (decision.nextAction === "dispatch") {
-    return {
-      who: agentName(agents, decision.targetAgent),
-      what: decision.stepTitle || "作業",
-      badge: step.run ? nodeBadge(step.run.status) : "spin",
-    };
-  }
-  if (decision.nextAction === "complete") {
-    return { who: "Grok", what: decision.stepTitle || "完了", badge: "done" };
-  }
-  return { who: "Grok", what: decision.stepTitle || "質問", badge: step.reply ? "done" : "ask" };
+export function agentKind(agents: AgentSpec[], id: string): AgentKind {
+  return agents.find((agent) => agent.id === id)?.kind ?? "custom";
 }
 
 export function sameProject(a: string, b: string) {
@@ -230,16 +281,21 @@ export function projectTasks(tasks: TaskMap, project: string) {
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
-export function liveTask(tasks: TaskMap) {
-  return Object.values(tasks).find((task) => isLive(task.status)) ?? null;
+/** The one job the hub is running now, if this screen knows about it. */
+export function liveRun(tasks: TaskMap): { task: TaskRecord; run: RunRecord } | null {
+  for (const task of Object.values(tasks)) {
+    const run = task.runs.find((item) => item.status === "running");
+    if (run) return { task, run };
+  }
+  return null;
 }
 
-export function plannerSessions(tasks: TaskMap) {
-  return new Set(Object.values(tasks).map((task) => task.plannerSession));
+export function queuedRuns(tasks: TaskMap) {
+  return Object.values(tasks).flatMap((task) => task.runs.filter((run) => run.status === "queued"));
 }
 
 export type OrchestraAction =
-  | { type: "tasks-loaded"; project: string; tasks: TaskRecord[] }
+  | { type: "tasks-loaded"; project: string | null; tasks: TaskRecord[]; requestedAt: number }
   | { type: "task-removed"; id: string }
   | { type: "select"; id: string | null }
   | { type: "log-batch"; nodeId: string; lines: LogLine[] }
@@ -248,93 +304,91 @@ export type OrchestraAction =
 export function reduceOrchestra(
   state: OrchestraState,
   event: Record<string, unknown> | OrchestraAction,
+  at: number = Date.now(),
 ): OrchestraState {
   const row = event as Record<string, unknown>;
   switch (String(row.type ?? "")) {
     case "task": {
       const task = row.task as TaskRecord | undefined;
-      if (!task || typeof task.id !== "string") return state;
-      return settlePlanning({ ...state, tasks: { ...state.tasks, [task.id]: task } }, task.id);
-    }
-    case "planning": {
-      const taskId = text(row.taskId);
-      if (!taskId) return state;
+      if (!task || typeof task.id !== "string" || !Array.isArray(task.runs)) return state;
       return {
         ...state,
-        planning: {
-          ...state.planning,
-          [taskId]: { stepId: text(row.stepId), nodeId: text(row.nodeId), turn: number(row.turn) },
-        },
+        tasks: { ...state.tasks, [task.id]: task },
+        touched: { ...state.touched, [task.id]: at },
       };
     }
-    case "decision": {
-      const taskId = text(row.taskId);
-      const step = row.step as Step | undefined;
-      if (!taskId || !step) return state;
-      return settlePlanning(updateTask(state, taskId, (task) => ({ ...task, steps: upsertStep(task.steps, step) })), taskId);
-    }
-    case "node-started": {
-      const taskId = text(row.taskId);
-      const stepId = text(row.stepId);
-      return updateTask(state, taskId, (task) => ({
-        ...task,
-        steps: task.steps.map((step) =>
-          step.id === stepId && !step.run
-            ? {
-                ...step,
-                run: {
-                  agentId: text(row.agentId),
-                  nodeId: text(row.nodeId),
-                  status: "running",
-                  startedAt: Date.now(),
-                  summary: "",
-                  diffStat: "",
-                  untracked: [],
-                },
-              }
-            : step,
-        ),
-      }));
-    }
-    case "node-finished": {
-      const taskId = text(row.taskId);
-      const stepId = text(row.stepId);
+    case "run": {
       const run = row.run as RunRecord | undefined;
-      if (!run) return state;
-      return updateTask(state, taskId, (task) => ({
-        ...task,
-        steps: task.steps.map((step) => (step.id === stepId ? { ...step, run } : step)),
-      }));
+      const taskId = typeof row.taskId === "string" ? row.taskId : run?.taskId;
+      if (!run || !taskId || typeof run.id !== "string") return state;
+      const task = state.tasks[taskId];
+      // A task not loaded yet still remembers the time, so a list fetched before this job
+      // changed cannot put the older state on screen.
+      if (!task) return { ...state, touched: { ...state.touched, [taskId]: at } };
+      const index = task.runs.findIndex((item) => item.id === run.id);
+      const runs = [...task.runs];
+      if (index < 0) runs.push(run);
+      else runs[index] = run;
+      const updatedAt = Math.max(task.updatedAt, run.endedAt ?? 0, run.startedAt ?? 0, run.queuedAt ?? 0);
+      return {
+        ...state,
+        tasks: { ...state.tasks, [taskId]: { ...task, runs, updatedAt } },
+        touched: { ...state.touched, [taskId]: at },
+      };
     }
-    case "state": {
-      const taskId = text(row.taskId);
-      const next = updateTask(state, taskId, (task) => ({
-        ...task,
-        status: (text(row.status) as TaskStatus) || task.status,
-        turn: number(row.turn) || task.turn,
-        maxTurns: number(row.maxTurns) || task.maxTurns,
-        reason: typeof row.reason === "string" ? row.reason : null,
-        updatedAt: Date.now(),
-      }));
-      return settlePlanning(next, taskId);
+    case "gateway": {
+      const status = row.status as GatewayStatus | undefined;
+      const rejected = row.rejected as Rejection | null | undefined;
+      return {
+        ...state,
+        gateway: {
+          status: status && typeof status.state === "string" ? status : state.gateway.status,
+          accepting: typeof row.accepting === "boolean" ? row.accepting : state.gateway.accepting,
+          rejections: rejected ? [rejected, ...state.gateway.rejections].slice(0, REJECTIONS) : state.gateway.rejections,
+        },
+      };
     }
     case "tasks-loaded": {
       const action = event as Extract<OrchestraAction, { type: "tasks-loaded" }>;
       const tasks = { ...state.tasks };
-      for (const [id, task] of Object.entries(tasks)) {
-        if (sameProject(task.project, action.project) && !isLive(task.status)) delete tasks[id];
+      const touched = { ...state.touched };
+      const fresher = (id: string) => (state.touched[id] ?? 0) > action.requestedAt;
+      if (action.project !== null) {
+        const listed = new Set(action.tasks.map((task) => task.id));
+        for (const [id, task] of Object.entries(tasks)) {
+          if (sameProject(task.project, action.project) && !listed.has(id) && !fresher(id)) {
+            delete tasks[id];
+            delete touched[id];
+          }
+        }
       }
       for (const task of action.tasks) {
-        const current = tasks[task.id];
-        if (!current || current.updatedAt <= task.updatedAt) tasks[task.id] = task;
+        if (!fresher(task.id)) tasks[task.id] = task;
       }
-      return { ...state, tasks };
+      return { ...state, tasks, touched };
     }
     case "task-removed": {
       const action = event as Extract<OrchestraAction, { type: "task-removed" }>;
+      const task = state.tasks[action.id];
       const tasks = { ...state.tasks };
+      const touched = { ...state.touched };
       delete tasks[action.id];
-      return { ...state, tasks, activeTaskId: state.activeTaskId === action.id ? null : state.activeTaskId };
+      delete touched[action.id];
+      let logs = state.logs;
+      let logOrder = state.logOrder;
+      if (task) {
+        const nodes = new Set(task.runs.map((run) => run.id));
+        logs = Object.fromEntries(Object.entries(state.logs).filter(([id]) => !nodes.has(id)));
+        logOrder = state.logOrder.filter((id) => !nodes.has(id));
+      }
+      return {
+        ...state,
+        tasks,
+        touched,
+        logs,
+        logOrder,
+        activeTaskId: state.activeTaskId === action.id ? null : state.activeTaskId,
+      };
     }
     case "select": {
       const action = event as Extract<OrchestraAction, { type: "select" }>;
@@ -344,37 +398,20 @@ export function reduceOrchestra(
     case "logs-loaded": {
       const action = event as Extract<OrchestraAction, { type: "log-batch" | "logs-loaded" }>;
       if (!action.nodeId || !Array.isArray(action.lines) || action.lines.length === 0) return state;
-      return { ...state, logs: { ...state.logs, [action.nodeId]: mergeLines(state.logs[action.nodeId], action.lines) } };
+      const logs = { ...state.logs, [action.nodeId]: mergeLines(state.logs[action.nodeId], action.lines) };
+      let logOrder = state.logOrder.includes(action.nodeId)
+        ? state.logOrder
+        : [...state.logOrder, action.nodeId];
+      while (logOrder.length > LOG_NODES) {
+        const [oldest, ...rest] = logOrder;
+        delete logs[oldest];
+        logOrder = rest;
+      }
+      return { ...state, logs, logOrder };
     }
     default:
       return state;
   }
-}
-
-function updateTask(state: OrchestraState, taskId: string, change: (task: TaskRecord) => TaskRecord): OrchestraState {
-  const task = state.tasks[taskId];
-  if (!task) return state;
-  return { ...state, tasks: { ...state.tasks, [taskId]: change(task) } };
-}
-
-function upsertStep(steps: Step[], step: Step) {
-  const index = steps.findIndex((item) => item.id === step.id);
-  if (index < 0) return [...steps, step];
-  const next = [...steps];
-  next[index] = step;
-  return next;
-}
-
-function settlePlanning(state: OrchestraState, taskId: string): OrchestraState {
-  const pending = state.planning[taskId];
-  if (!pending) return state;
-  const task = state.tasks[taskId];
-  const step = task?.steps.find((item) => item.id === pending.stepId);
-  const done = !task || task.status !== "running" || Boolean(step && (step.decision || step.error));
-  if (!done) return state;
-  const planning = { ...state.planning };
-  delete planning[taskId];
-  return { ...state, planning };
 }
 
 function mergeLines(current: LogLine[] | undefined, incoming: LogLine[]) {
@@ -411,13 +448,13 @@ export function blankCustomAgent(agents: AgentSpec[]): AgentSpec {
     output: "text",
     role: "",
     allowDangerous: false,
+    timeoutSecs: null,
   };
 }
 
-function text(value: unknown) {
-  return typeof value === "string" ? value : "";
-}
-
-function number(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+export function formatSeconds(total: number) {
+  if (total < 60) return `${total}秒`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return seconds ? `${minutes}分${seconds}秒` : `${minutes}分`;
 }

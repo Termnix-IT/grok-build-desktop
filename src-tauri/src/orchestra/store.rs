@@ -60,43 +60,29 @@ pub fn delete(tasks_dir: &Path, id: &str) -> Result<(), String> {
     }
 }
 
-pub fn same_project(left: &str, right: &Path) -> bool {
-    fn normalize(path: &str) -> String {
-        let path = path.replace('/', "\\");
-        let path = path.trim_end_matches('\\');
-        if cfg!(windows) {
-            path.to_lowercase()
-        } else {
-            path.to_owned()
-        }
-    }
-    normalize(left) == normalize(&right.to_string_lossy())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestra::engine::TaskStatus;
+    use crate::orchestra::engine::{Source, TaskStatus};
 
     #[test]
     fn records_round_trip_replace_and_skip_broken_files() {
         let dir = std::env::temp_dir().join(format!("gbd-store-{}", uuid::Uuid::new_v4()));
         let mut task = TaskRecord {
-            id: "t1-test".into(),
+            id: "t0123456789ab".into(),
             project: "C:/project".into(),
-            goal: "テスト".into(),
+            title: "テスト".into(),
+            source: Source::Bot,
             created_at: 1,
             updated_at: 1,
-            status: TaskStatus::Running,
-            reason: None,
-            turn: 0,
-            max_turns: 10,
-            planner_session: uuid::Uuid::new_v4().to_string(),
-            planner_started: false,
-            steps: Vec::new(),
+            status: TaskStatus::Open,
+            pause_reason: None,
+            dispatches: 0,
+            dispatch_limit: 10,
+            runs: Vec::new(),
         };
         save(&dir, &task).unwrap();
-        task.status = TaskStatus::Completed;
+        task.status = TaskStatus::Closed;
         save(&dir, &task).unwrap();
         fs::write(dir.join("broken.json"), "{").unwrap();
         fs::write(
@@ -106,21 +92,11 @@ mod tests {
         .unwrap();
         let loaded = load(&dir);
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].status, TaskStatus::Completed);
-        assert_eq!(loaded[0].goal, "テスト");
+        assert_eq!(loaded[0].status, TaskStatus::Closed);
+        assert_eq!(loaded[0].title, "テスト");
         assert!(delete(&dir, "../outside").is_err());
         delete(&dir, &task.id).unwrap();
         assert!(load(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn compares_project_separators_and_trailing_slashes() {
-        assert!(same_project("C:/project/", Path::new("C:\\project")));
-        assert!(!same_project("C:/project", Path::new("C:/project-other")));
-        assert_eq!(
-            same_project("C:/PROJECT", Path::new("c:/project")),
-            cfg!(windows)
-        );
     }
 }

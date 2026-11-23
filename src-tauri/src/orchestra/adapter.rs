@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::breaker;
 use super::config::{self, AgentSpec, OutputFormat, PromptVia};
-use super::engine::{LogStream, NodeStatus};
+use super::engine::{LogStream, RunStatus};
 use super::runner;
 
 pub struct DispatchRequest<'a> {
@@ -24,6 +23,7 @@ pub struct LaunchPlan {
 pub trait AgentAdapter: Send + Sync {
     fn spec(&self) -> &AgentSpec;
     fn launch(&self, req: &DispatchRequest) -> Result<LaunchPlan, String>;
+    /// `line` is the whole output line (up to the runner's frame limit), not the shortened log text.
     fn observe(&self, stream: LogStream, line: &str, acc: &mut Accumulator);
     fn outcome(&self, acc: Accumulator, exit: &ExitInfo) -> AgentOutcome;
 }
@@ -35,11 +35,20 @@ pub struct ExitInfo {
 }
 
 pub struct AgentOutcome {
-    pub status: NodeStatus,
+    pub status: RunStatus,
     pub summary: String,
     pub stderr_tail: String,
-    pub error_signature: Option<String>,
+    /// Actions the agent wanted but the headless CLI refused.
+    pub denied: Vec<String>,
+    /// The run failed and the CLI reported refused actions, so the refusal is the likely cause.
+    pub denied_failure: bool,
 }
+
+const WHOLE_LIMIT: usize = 1024 * 1024;
+const CHUNK_LIMIT: usize = 16000;
+const DENIED_LIMIT: usize = 20;
+const DENIED_CHARS: usize = 200;
+const GROK_DENIED_PREFIX: &str = "permission required: ";
 
 #[derive(Default)]
 pub struct Accumulator {
@@ -49,9 +58,38 @@ pub struct Accumulator {
     result: Option<String>,
     failure: Option<String>,
     failed: bool,
+    denied: Vec<String>,
+    overlong: bool,
     grok_message_id: Option<String>,
     grok_chunks: String,
-    grok_json: String,
+    /// Counts tool calls in Grok's streaming JSON; text after the last one is the answer.
+    grok_segment: u32,
+    /// Raw stdout for formats that may print one JSON value over several lines.
+    whole: String,
+}
+
+impl Accumulator {
+    /// The runner dropped a line that was too long to parse.
+    pub fn note_overlong(&mut self) {
+        self.overlong = true;
+    }
+
+    fn deny(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() || self.denied.len() >= DENIED_LIMIT {
+            return;
+        }
+        let entry: String = if text.chars().count() > DENIED_CHARS {
+            let mut short: String = text.chars().take(DENIED_CHARS - 1).collect();
+            short.push('…');
+            short
+        } else {
+            text.into()
+        };
+        if !self.denied.contains(&entry) {
+            self.denied.push(entry);
+        }
+    }
 }
 
 pub struct ConfiguredAdapter {
@@ -65,6 +103,13 @@ impl ConfiguredAdapter {
             spec,
             log_tail_bytes,
         }
+    }
+
+    fn keeps_whole(&self) -> bool {
+        matches!(
+            self.spec.output,
+            OutputFormat::GrokJson | OutputFormat::AntigravityJson
+        )
     }
 }
 
@@ -107,6 +152,11 @@ impl AgentAdapter for ConfiguredAdapter {
     fn observe(&self, stream: LogStream, line: &str, acc: &mut Accumulator) {
         match stream {
             LogStream::Stderr => {
+                if self.spec.output == OutputFormat::GrokJson
+                    && let Some(action) = line.trim_start().strip_prefix(GROK_DENIED_PREFIX)
+                {
+                    acc.deny(action);
+                }
                 append_line(&mut acc.stderr_tail, line);
                 retain_tail_bytes(&mut acc.stderr_tail, self.log_tail_bytes);
                 return;
@@ -116,14 +166,18 @@ impl AgentAdapter for ConfiguredAdapter {
         }
         append_line(&mut acc.stdout_tail, line);
         retain_tail_chars(&mut acc.stdout_tail, 2000);
-        if self.spec.output == OutputFormat::GrokJson {
-            append_line(&mut acc.grok_json, line);
+        if self.keeps_whole() && acc.whole.len() + line.len() < WHOLE_LIMIT {
+            append_line(&mut acc.whole, line);
+        }
+        if self.spec.output == OutputFormat::AntigravityJson {
+            // Parsed once at the end: the JSON may span lines and follow warning lines.
+            return;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return;
         };
         match self.spec.output {
-            OutputFormat::Text => {}
+            OutputFormat::Text | OutputFormat::AntigravityJson => {}
             OutputFormat::ClaudeStreamJson => observe_claude(&value, acc),
             OutputFormat::CodexJsonl => observe_codex(&value, acc),
             OutputFormat::GrokJson => observe_grok(&value, acc),
@@ -131,49 +185,61 @@ impl AgentAdapter for ConfiguredAdapter {
     }
 
     fn outcome(&self, mut acc: Accumulator, exit: &ExitInfo) -> AgentOutcome {
-        if self.spec.output == OutputFormat::GrokJson
-            && acc.message.is_none()
-            && acc.result.is_none()
-        {
-            if let Ok(value) = serde_json::from_str::<Value>(&acc.grok_json) {
-                observe_grok(&value, &mut acc);
+        match self.spec.output {
+            // One JSON value printed over several lines; streamed chunks were already read.
+            OutputFormat::GrokJson
+                if acc.message.is_none() && acc.result.is_none() && acc.grok_chunks.is_empty() =>
+            {
+                if let Some(value) = last_json_object(&acc.whole) {
+                    observe_grok(&value, &mut acc);
+                }
             }
+            OutputFormat::AntigravityJson => {
+                if let Some(value) = last_json_object(&acc.whole) {
+                    observe_antigravity(&value, &mut acc);
+                }
+            }
+            _ => {}
+        }
+        if acc.message.is_none() && !acc.grok_chunks.is_empty() {
+            acc.message = Some(std::mem::take(&mut acc.grok_chunks));
         }
         let status = if exit.timed_out {
-            NodeStatus::TimedOut
+            RunStatus::TimedOut
         } else if exit.killed {
-            NodeStatus::Killed
+            RunStatus::Killed
         } else if exit.code != Some(0) || acc.failed {
-            NodeStatus::Failed
+            RunStatus::Failed
         } else {
-            NodeStatus::Succeeded
+            RunStatus::Succeeded
         };
-        let mut summary = acc
+        let answer = acc
             .result
-            .or(acc.message)
-            .filter(|text| !text.is_empty())
-            .or_else(|| acc.failure.clone())
-            .unwrap_or_else(|| acc.stdout_tail.trim_end_matches(['\r', '\n']).to_owned());
-        if let Some(error) = acc.failure {
-            summary = if summary.is_empty() || summary == error {
-                error
-            } else {
-                format!("{error}\n{summary}")
-            };
+            .take()
+            .or(acc.message.take())
+            .filter(|text| !text.trim().is_empty());
+        let mut summary = match (&answer, &acc.failure) {
+            (Some(answer), _) => answer.clone(),
+            (None, Some(failure)) => failure.clone(),
+            (None, None) if !acc.denied.is_empty() => format!(
+                "ヘッドレスの CLI が操作を拒否しました: {}",
+                acc.denied.join("、")
+            ),
+            (None, None) if acc.overlong => "出力の行が長すぎて読み取れませんでした".into(),
+            (None, None) => acc.stdout_tail.trim_end_matches(['\r', '\n']).to_owned(),
+        };
+        if let (Some(_), Some(failure)) = (&answer, &acc.failure)
+            && summary != *failure
+        {
+            summary = format!("{failure}\n{summary}");
         }
         let stderr_tail = acc.stderr_tail.trim_end_matches(['\r', '\n']).to_owned();
-        let error_signature = (status != NodeStatus::Succeeded).then(|| {
-            breaker::error_signature(
-                &self.spec.id,
-                exit.code,
-                &format!("{summary}\n{stderr_tail}"),
-            )
-        });
         AgentOutcome {
+            denied_failure: status == RunStatus::Failed && !acc.denied.is_empty(),
             status,
             summary,
             stderr_tail,
-            error_signature,
+            denied: acc.denied,
         }
     }
 }
@@ -207,24 +273,60 @@ fn retain_tail_bytes(text: &mut String, limit: usize) {
     }
 }
 
+/// The last top-level JSON object in `text`. A top-level object starts at the beginning of a
+/// line, so warning lines printed before it and indented nested objects are skipped.
+fn last_json_object(text: &str) -> Option<Value> {
+    let starts = text
+        .match_indices('{')
+        .map(|(index, _)| index)
+        .filter(|&index| index == 0 || text.as_bytes()[index - 1] == b'\n');
+    let candidates: Vec<usize> = starts.collect();
+    candidates.into_iter().rev().find_map(|start| {
+        serde_json::from_str::<Value>(text[start..].trim_end())
+            .ok()
+            .filter(Value::is_object)
+    })
+}
+
+fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
 fn observe_claude(value: &Value, acc: &mut Accumulator) {
-    match value.get("type").and_then(Value::as_str) {
+    match str_field(value, "type") {
         Some("result") => {
-            if let Some(text) = value.get("result").and_then(Value::as_str) {
+            if let Some(text) = str_field(value, "result") {
                 acc.result = Some(text.into());
             }
             if value.get("is_error").and_then(Value::as_bool) == Some(true)
-                || value.get("subtype").and_then(Value::as_str) != Some("success")
+                || str_field(value, "subtype") != Some("success")
             {
                 acc.failed = true;
+            }
+            for denial in value
+                .get("permission_denials")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let tool = str_field(denial, "tool_name").unwrap_or("?");
+                let input = denial.get("tool_input");
+                let detail = input
+                    .and_then(|input| {
+                        str_field(input, "command").or_else(|| str_field(input, "file_path"))
+                    })
+                    .map(str::to_owned)
+                    .or_else(|| input.map(Value::to_string))
+                    .unwrap_or_default();
+                acc.deny(&format!("{tool}: {detail}"));
             }
         }
         Some("assistant") => {
             if let Some(content) = value.pointer("/message/content").and_then(Value::as_array) {
                 let texts: Vec<_> = content
                     .iter()
-                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .filter(|item| str_field(item, "type") == Some("text"))
+                    .filter_map(|item| str_field(item, "text"))
                     .collect();
                 if !texts.is_empty() {
                     acc.message = Some(texts.join(""));
@@ -236,7 +338,7 @@ fn observe_claude(value: &Value, acc: &mut Accumulator) {
 }
 
 fn observe_codex(value: &Value, acc: &mut Accumulator) {
-    match value.get("type").and_then(Value::as_str) {
+    match str_field(value, "type") {
         Some("item.completed") => {
             let kind = value.pointer("/item/type").and_then(Value::as_str);
             if matches!(kind, Some("agent_message" | "assistant_message")) {
@@ -254,49 +356,89 @@ fn observe_codex(value: &Value, acc: &mut Accumulator) {
         }
         Some("error") => {
             acc.failed = true;
-            acc.failure = value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            acc.failure = str_field(value, "message").map(str::to_owned);
         }
         _ => {}
     }
 }
 
 fn observe_grok(value: &Value, acc: &mut Accumulator) {
-    if value.get("type").and_then(Value::as_str) == Some("error") {
+    if str_field(value, "type") == Some("error") {
         acc.failed = true;
-        acc.failure = value
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        acc.failure = str_field(value, "message").map(str::to_owned);
         return;
     }
     let update = value.get("update").unwrap_or(value);
-    let kind = update
-        .get("sessionUpdate")
-        .or_else(|| update.get("session_update"))
-        .and_then(Value::as_str);
+    if [value, update]
+        .iter()
+        .any(|item| str_field(item, "stopReason") == Some("cancelled"))
+    {
+        // A headless run stops with "cancelled" when it needed an approval it could not ask for.
+        acc.failed = true;
+    }
+    // `--output-format streaming-json`: {"type":"text","data":"…"} pieces, with tool calls
+    // between the turns, then {"type":"end","stopReason":…}.
+    match str_field(value, "type") {
+        Some("text") => {
+            if let Some(text) = str_field(value, "data") {
+                let id = Some(format!("streaming-{}", acc.grok_segment));
+                push_grok_chunk(acc, id, text);
+            }
+            return;
+        }
+        Some("tool_call" | "tool_call_update") => {
+            acc.grok_segment += 1;
+            return;
+        }
+        Some("thought" | "usage" | "available_commands" | "end") => return,
+        _ => {}
+    }
+    let kind = str_field(update, "sessionUpdate").or_else(|| str_field(update, "session_update"));
     if kind == Some("agent_message_chunk") {
         if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
-            let id = update
-                .get("messageId")
-                .or_else(|| value.get("messageId"))
-                .and_then(Value::as_str)
+            let id = str_field(update, "messageId")
+                .or_else(|| str_field(value, "messageId"))
                 .map(str::to_owned);
-            if id != acc.grok_message_id {
-                acc.grok_chunks.clear();
-                acc.grok_message_id = id;
-            }
-            acc.grok_chunks.push_str(text);
-            acc.message = Some(acc.grok_chunks.clone());
+            push_grok_chunk(acc, id, text);
         }
-    } else if let Some(text) = value
-        .get("result")
-        .or_else(|| value.get("text"))
-        .and_then(Value::as_str)
-    {
+    } else if let Some(text) = str_field(value, "result").or_else(|| str_field(value, "text")) {
         acc.result = Some(text.into());
+    }
+}
+
+/// A chunk of a new message replaces the chunks of the one before it.
+fn push_grok_chunk(acc: &mut Accumulator, id: Option<String>, text: &str) {
+    if id != acc.grok_message_id {
+        acc.grok_chunks.clear();
+        acc.grok_message_id = id;
+    }
+    let room = CHUNK_LIMIT.saturating_sub(acc.grok_chunks.chars().count());
+    acc.grok_chunks.extend(text.chars().take(room));
+}
+
+fn observe_antigravity(value: &Value, acc: &mut Accumulator) {
+    if let Some(text) = str_field(value, "response") {
+        acc.result = Some(text.trim_end_matches(['\r', '\n']).into());
+    }
+    let status = str_field(value, "status").unwrap_or_default();
+    if status != "SUCCESS" {
+        acc.failed = true;
+        acc.failure = str_field(value, "error")
+            .or_else(|| str_field(value, "message"))
+            .map(str::to_owned)
+            .or_else(|| Some(format!("Antigravity の状態: {status}")));
+    }
+    for action in value
+        .get("denied_actions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = str_field(action, "display_name").unwrap_or("?");
+        match str_field(action, "action") {
+            Some(kind) => acc.deny(&format!("{name} ({kind})")),
+            None => acc.deny(name),
+        }
     }
 }
 
@@ -317,23 +459,33 @@ mod tests {
             output,
             role: String::new(),
             allow_dangerous: false,
+            timeout_secs: None,
         }
     }
 
-    fn parsed(output: OutputFormat, lines: &[&str], code: i32) -> AgentOutcome {
+    fn exit(code: i32) -> ExitInfo {
+        ExitInfo {
+            code: Some(code),
+            killed: false,
+            timed_out: false,
+        }
+    }
+
+    fn run(output: OutputFormat, lines: &[(LogStream, &str)], code: i32) -> AgentOutcome {
         let adapter = ConfiguredAdapter::new(spec(output), 4096);
         let mut acc = Accumulator::default();
-        for line in lines {
-            adapter.observe(LogStream::Stdout, line, &mut acc);
+        for (stream, line) in lines {
+            adapter.observe(*stream, line, &mut acc);
         }
-        adapter.outcome(
-            acc,
-            &ExitInfo {
-                code: Some(code),
-                killed: false,
-                timed_out: false,
-            },
-        )
+        adapter.outcome(acc, &exit(code))
+    }
+
+    fn parsed(output: OutputFormat, lines: &[&str], code: i32) -> AgentOutcome {
+        let lines: Vec<_> = lines
+            .iter()
+            .map(|line| (LogStream::Stdout, *line))
+            .collect();
+        run(output, &lines, code)
     }
 
     #[test]
@@ -344,25 +496,18 @@ mod tests {
         adapter.observe(LogStream::Stdout, &"あ".repeat(2100), &mut acc);
         adapter.observe(LogStream::Stderr, "先頭末尾", &mut acc);
         adapter.observe(LogStream::System, "ignored", &mut acc);
-        let result = adapter.outcome(
-            acc,
-            &ExitInfo {
-                code: Some(0),
-                killed: false,
-                timed_out: false,
-            },
-        );
-        assert_eq!(result.status, NodeStatus::Succeeded);
+        let result = adapter.outcome(acc, &exit(0));
+        assert_eq!(result.status, RunStatus::Succeeded);
         assert_eq!(result.summary.chars().count(), 2000);
         assert_eq!(result.stderr_tail, "末尾");
-        assert!(result.error_signature.is_none());
+        assert!(result.denied.is_empty() && !result.denied_failure);
         assert_eq!(
             parsed(OutputFormat::Text, &["failed"], 3).status,
-            NodeStatus::Failed
+            RunStatus::Failed
         );
         for (killed, timed_out, expected) in [
-            (true, false, NodeStatus::Killed),
-            (true, true, NodeStatus::TimedOut),
+            (true, false, RunStatus::Killed),
+            (true, true, RunStatus::TimedOut),
         ] {
             let result = adapter.outcome(
                 Accumulator::default(),
@@ -373,18 +518,17 @@ mod tests {
                 },
             );
             assert_eq!(result.status, expected);
-            assert!(result.error_signature.is_some());
         }
     }
 
     #[test]
-    fn claude_result_fallback_and_error() {
+    fn claude_result_fallback_error_and_denials() {
         let lines = [
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"途中"},{"type":"text","text":"の返事"}]}}"#,
             r#"{"type":"result","subtype":"success","is_error":false,"result":"完了"}"#,
         ];
         let result = parsed(OutputFormat::ClaudeStreamJson, &lines, 0);
-        assert_eq!(result.status, NodeStatus::Succeeded);
+        assert_eq!(result.status, RunStatus::Succeeded);
         assert_eq!(result.summary, "完了");
         assert_eq!(
             parsed(OutputFormat::ClaudeStreamJson, &lines[..1], 0).summary,
@@ -396,9 +540,26 @@ mod tests {
         ] {
             assert_eq!(
                 parsed(OutputFormat::ClaudeStreamJson, &[line], 0).status,
-                NodeStatus::Failed
+                RunStatus::Failed
             );
         }
+        let denied = parsed(
+            OutputFormat::ClaudeStreamJson,
+            &[
+                r#"{"type":"result","subtype":"success","result":"一部できませんでした","permission_denials":[{"tool_name":"Bash","tool_input":{"command":"rm -rf build"}},{"tool_name":"Write","tool_input":{"file_path":"C:/x.txt"}},{"tool_name":"WebFetch","tool_input":{"url":"u"}}]}"#,
+            ],
+            0,
+        );
+        assert_eq!(denied.status, RunStatus::Succeeded);
+        assert_eq!(
+            denied.denied,
+            [
+                "Bash: rm -rf build",
+                "Write: C:/x.txt",
+                r#"WebFetch: {"url":"u"}"#
+            ]
+        );
+        assert!(!denied.denied_failure);
     }
 
     #[test]
@@ -408,14 +569,14 @@ mod tests {
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"最後の返事"}}"#,
         ];
         let result = parsed(OutputFormat::CodexJsonl, &lines, 0);
-        assert_eq!(result.status, NodeStatus::Succeeded);
+        assert_eq!(result.status, RunStatus::Succeeded);
         assert_eq!(result.summary, "最後の返事");
         for error in [
             r#"{"type":"turn.failed","error":{"message":"失敗しました"}}"#,
             r#"{"type":"error","message":"失敗しました"}"#,
         ] {
             let result = parsed(OutputFormat::CodexJsonl, &[lines[1], error], 0);
-            assert_eq!(result.status, NodeStatus::Failed);
+            assert_eq!(result.status, RunStatus::Failed);
             assert_eq!(result.summary, "失敗しました\n最後の返事");
         }
     }
@@ -428,7 +589,7 @@ mod tests {
             r#"{"update":{"sessionUpdate":"agent_message_chunk","messageId":"two","content":{"text":"返事"}}}"#,
         ];
         let result = parsed(OutputFormat::GrokJson, &lines, 0);
-        assert_eq!(result.status, NodeStatus::Succeeded);
+        assert_eq!(result.status, RunStatus::Succeeded);
         assert_eq!(result.summary, "最後の返事");
         assert_eq!(
             parsed(
@@ -448,8 +609,161 @@ mod tests {
             &[r#"{"type":"error","message":"失敗"}"#],
             0,
         );
-        assert_eq!(result.status, NodeStatus::Failed);
+        assert_eq!(result.status, RunStatus::Failed);
         assert!(result.summary.starts_with("失敗"));
+        let long = format!(
+            r#"{{"sessionUpdate":"agent_message_chunk","content":{{"text":"{}"}}}}"#,
+            "あ".repeat(CHUNK_LIMIT + 10)
+        );
+        assert_eq!(
+            parsed(OutputFormat::GrokJson, &[&long, &long], 0)
+                .summary
+                .chars()
+                .count(),
+            CHUNK_LIMIT
+        );
+    }
+
+    #[test]
+    fn grok_streaming_json_keeps_the_text_after_the_last_tool_call() {
+        // Shortened from a real `grok --output-format streaming-json` run (grok 1.0.92).
+        let lines = [
+            r#"{"type":"available_commands","tools":["read_file"]}"#,
+            r#"{"type":"thought","data":"README.txt を読む。"}"#,
+            r#"{"type":"text","data":"README"}"#,
+            r#"{"type":"text","data":".txt を読みます。"}"#,
+            r#"{"type":"usage","usage":{"input_tokens":1}}"#,
+            r#"{"type":"tool_call","toolCallId":"c1","title":"read_file","kind":"read","status":"pending"}"#,
+            r#"{"type":"tool_call_update","toolCallId":"c1","status":"completed"}"#,
+            r#"{"type":"thought","data":"demo と書かれている。"}"#,
+            r#"{"type":"text","data":"de"}"#,
+            r#"{"type":"text","data":"mo"}"#,
+            r#"{"type":"end","stopReason":"end_turn","sessionId":"s"}"#,
+        ];
+        let result = parsed(OutputFormat::GrokJson, &lines, 0);
+        assert_eq!(result.status, RunStatus::Succeeded);
+        assert_eq!(result.summary, "demo");
+        let cancelled = parsed(
+            OutputFormat::GrokJson,
+            &[
+                r#"{"type":"text","data":"消せませんでした"}"#,
+                r#"{"type":"end","stopReason":"cancelled","sessionId":"s"}"#,
+            ],
+            0,
+        );
+        assert_eq!(cancelled.status, RunStatus::Failed);
+        assert_eq!(cancelled.summary, "消せませんでした");
+    }
+
+    #[test]
+    fn grok_refusals_fail_the_run() {
+        let result = run(
+            OutputFormat::GrokJson,
+            &[
+                (
+                    LogStream::Stderr,
+                    "permission required: Execute `Remove-Item b.txt` was not run, as a headless run cannot ask for approval",
+                ),
+                (
+                    LogStream::Stdout,
+                    r#"{"text":"削除できませんでした","stopReason":"cancelled","sessionId":"s"}"#,
+                ),
+            ],
+            0,
+        );
+        assert_eq!(result.status, RunStatus::Failed);
+        assert!(result.denied_failure);
+        assert_eq!(
+            result.denied,
+            ["Execute `Remove-Item b.txt` was not run, as a headless run cannot ask for approval"]
+        );
+        assert_eq!(result.summary, "削除できませんでした");
+        let plain = parsed(
+            OutputFormat::GrokJson,
+            &[r#"{"text":"止まりました","stopReason":"cancelled"}"#],
+            0,
+        );
+        assert_eq!(plain.status, RunStatus::Failed);
+        assert!(!plain.denied_failure);
+    }
+
+    #[test]
+    fn antigravity_json_after_warnings_and_over_lines() {
+        let ok = parsed(
+            OutputFormat::AntigravityJson,
+            &[
+                "warning: --mode auto is not available for this account",
+                r#"{"conversation_id":"c","status":"SUCCESS","response":"作成しました\n","duration_seconds":12.3,"num_turns":1,"usage":{}}"#,
+            ],
+            0,
+        );
+        assert_eq!(ok.status, RunStatus::Succeeded);
+        assert_eq!(ok.summary, "作成しました");
+        let pretty = parsed(
+            OutputFormat::AntigravityJson,
+            &[
+                "{",
+                r#"  "status": "SUCCESS","#,
+                r#"  "usage": {"a": 1},"#,
+                r#"  "response": "複数行""#,
+                "}",
+            ],
+            0,
+        );
+        assert_eq!(pretty.summary, "複数行");
+        let denied = parsed(
+            OutputFormat::AntigravityJson,
+            &[
+                r#"{"conversation_id":"c","status":"SUCCESS","response":"","num_turns":1,"usage":{},"denied_actions":[{"action":"command","display_name":"Bash"}]}"#,
+            ],
+            0,
+        );
+        assert_eq!(denied.status, RunStatus::Succeeded);
+        assert_eq!(denied.denied, ["Bash (command)"]);
+        assert_eq!(
+            denied.summary,
+            "ヘッドレスの CLI が操作を拒否しました: Bash (command)"
+        );
+        let failed = parsed(
+            OutputFormat::AntigravityJson,
+            &[
+                r#"{"status":"ERROR","response":"","denied_actions":[{"action":"command","display_name":"Bash"}]}"#,
+            ],
+            0,
+        );
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert!(failed.denied_failure);
+        assert_eq!(failed.summary, "Antigravity の状態: ERROR");
+        assert_eq!(
+            parsed(OutputFormat::AntigravityJson, &["not json"], 0).summary,
+            "not json"
+        );
+    }
+
+    #[test]
+    fn overlong_lines_and_denial_limits() {
+        let adapter = ConfiguredAdapter::new(spec(OutputFormat::ClaudeStreamJson), 4096);
+        let mut acc = Accumulator::default();
+        acc.note_overlong();
+        let result = adapter.outcome(acc, &exit(0));
+        assert_eq!(result.summary, "出力の行が長すぎて読み取れませんでした");
+        let mut acc = Accumulator::default();
+        for index in 0..30 {
+            acc.deny(&format!("{index} {}", "x".repeat(300)));
+        }
+        acc.deny("");
+        assert_eq!(acc.denied.len(), DENIED_LIMIT);
+        assert!(
+            acc.denied
+                .iter()
+                .all(|entry| entry.chars().count() == DENIED_CHARS)
+        );
+        let big = "x".repeat(WHOLE_LIMIT);
+        let grok = ConfiguredAdapter::new(spec(OutputFormat::GrokJson), 4096);
+        let mut acc = Accumulator::default();
+        grok.observe(LogStream::Stdout, &big, &mut acc);
+        grok.observe(LogStream::Stdout, "{}", &mut acc);
+        assert!(acc.whole.len() < WHOLE_LIMIT);
     }
 
     #[test]
@@ -482,7 +796,7 @@ mod tests {
         for (via, placeholder) in [
             (PromptVia::Stdin, "{cwd}"),
             (PromptVia::File, "{promptFile}"),
-            (PromptVia::Arg, "{prompt}"),
+            (PromptVia::Arg, "-p={prompt}"),
         ] {
             agent.prompt_via = via;
             agent.args = vec![placeholder.into()];
@@ -496,7 +810,7 @@ mod tests {
                     plan.prompt_file,
                     Some((prompt_file.clone(), req.prompt.into()))
                 ),
-                PromptVia::Arg => assert_eq!(plan.args, vec![req.prompt]),
+                PromptVia::Arg => assert_eq!(plan.args, vec![format!("-p={}", req.prompt)]),
             }
         }
         agent.prompt_via = PromptVia::Stdin;

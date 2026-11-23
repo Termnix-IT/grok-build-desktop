@@ -4,14 +4,17 @@ import {
   type AgentSpec,
   type Badge,
   type LogLine,
-  type Planning,
   type RunRecord,
-  type Step,
   type TaskRecord,
-  NODE_STATUS_LABEL,
+  ERROR_KIND_LABEL,
+  FILE_CHANGE_MARK,
+  RUN_STATUS_LABEL,
+  SOURCE_LABEL,
   TASK_STATUS_LABEL,
+  agentKind,
   agentName,
-  nodeBadge,
+  formatSeconds,
+  runBadge,
 } from "./orchestra";
 
 export interface LogTarget {
@@ -21,6 +24,7 @@ export interface LogTarget {
 
 const BADGE_LABEL: Record<Badge, string> = {
   spin: "実行中",
+  wait: "待機中",
   done: "完了",
   error: "エラー",
   ask: "要確認",
@@ -31,174 +35,196 @@ export function StatusBadge({ badge, label }: { badge: Badge; label?: string }) 
   return <span className={`badge ${badge}`} role="img" aria-label={label ?? BADGE_LABEL[badge]} title={label ?? BADGE_LABEL[badge]} />;
 }
 
-export function FlowTimeline({
+export interface JobActions {
+  onOpenLog: (target: LogTarget) => void;
+  onCancel: (jobId: string) => void;
+  onKill: (jobId: string) => void;
+}
+
+export function TaskTimeline({
   task,
   agents,
-  planning,
+  busy,
+  onResume,
+  onClose,
   onOpenLog,
-}: {
+  onCancel,
+  onKill,
+}: JobActions & {
   task: TaskRecord;
   agents: AgentSpec[];
-  planning: Planning | null;
-  onOpenLog: (target: LogTarget) => void;
+  busy: boolean;
+  onResume: (taskId: string) => void;
+  onClose: (taskId: string) => void;
 }) {
-  const pendingPlan = planning && !task.steps.some((step) => step.id === planning.stepId) ? planning : null;
-  const stopped = task.status === "paused" || task.status === "error" || task.status === "aborted";
   return (
     <div className="flow">
-      <article className="bubble user">
-        <MarkdownBody text={task.goal} />
-      </article>
-      {task.steps.map((step) => (
-        <StepCard key={step.id} step={step} agents={agents} onOpenLog={onOpenLog} />
+      <header className="flow-task">
+        <span className={`source-chip ${task.source}`}>{SOURCE_LABEL[task.source]}</span>
+        <span className="flow-meta">{TASK_STATUS_LABEL[task.status]}</span>
+        <span className="flow-meta" title="このタスクのジョブの数と上限">
+          {task.dispatches} / {task.dispatchLimit}
+        </span>
+        <span className="flow-path" title={task.project}>{task.project}</span>
+        {task.status !== "closed" && (
+          <button type="button" className="flow-log" disabled={busy} onClick={() => onClose(task.id)}>
+            閉じる
+          </button>
+        )}
+      </header>
+      {task.runs.map((run) => (
+        <JobCard key={run.id} run={run} agents={agents} onOpenLog={onOpenLog} onCancel={onCancel} onKill={onKill} />
       ))}
-      {pendingPlan && (
-        <ThinkingCard turn={pendingPlan.turn} onLog={() => onOpenLog({ nodeId: pendingPlan.nodeId, title: `Grok · 判断 ${pendingPlan.turn}` })} />
+      {task.status === "paused" && (
+        <article className="notice flow-stop">
+          <strong>{TASK_STATUS_LABEL.paused}</strong>
+          {task.pauseReason && <p className="md-plain">{task.pauseReason}</p>}
+          <div className="flow-actions">
+            <button type="button" className="solid" disabled={busy} onClick={() => onResume(task.id)}>
+              再開
+            </button>
+          </div>
+        </article>
       )}
-      {stopped && (
-        <article className={task.status === "paused" ? "notice flow-stop" : "notice flow-stop warn"}>
-          <strong>{TASK_STATUS_LABEL[task.status]}</strong>
-          {task.reason && task.reason !== task.steps[task.steps.length - 1]?.error && <p className="md-plain">{task.reason}</p>}
+      {task.status === "closed" && (
+        <article className="notice flow-stop">
+          <strong>{TASK_STATUS_LABEL.closed}</strong>
         </article>
       )}
     </div>
   );
 }
 
-const StepCard = memo(function StepCard({
-  step,
+const JobCard = memo(function JobCard({
+  run,
   agents,
-  onOpenLog,
-}: {
-  step: Step;
+  ...actions
+}: JobActions & {
+  run: RunRecord;
   agents: AgentSpec[];
-  onOpenLog: (target: LogTarget) => void;
 }) {
-  const decision = step.decision;
-  const planLog = () => onOpenLog({ nodeId: step.planNodeId, title: `Grok · 判断 ${step.turn}` });
-  if (!decision) {
-    if (!step.error) return <ThinkingCard turn={step.turn} onLog={planLog} />;
-    return (
-      <article className="flow-card fail">
-        <header className="flow-head">
-          <StatusBadge badge="error" />
-          <span className="agent-chip grok">Grok</span>
-          <strong>判断の失敗</strong>
-          <span className="flow-turn">{step.turn}</span>
-          <button type="button" className="flow-log" onClick={planLog}>ログ</button>
-        </header>
-        <p className="flow-error">{step.error}</p>
-      </article>
-    );
-  }
-  const kind = decision.nextAction;
-  const title =
-    decision.stepTitle || (kind === "dispatch" ? "作業" : kind === "complete" ? "完了" : "質問");
-  const target = kind === "dispatch" ? agents.find((agent) => agent.id === decision.targetAgent) : undefined;
+  const who = agentName(agents, run.agentId);
+  const seconds =
+    run.startedAt && run.endedAt ? Math.max(0, Math.round((run.endedAt - run.startedAt) / 1000)) : null;
+  const errorText = run.error?.message?.trim() ?? "";
+  const showError = Boolean(run.error) && errorText !== run.summary.trim();
+  const failed = run.status === "failed" || run.status === "timedOut";
   return (
-    <>
-      <article className={`flow-card ${kind}`}>
-        <header className="flow-head">
-          <span className="agent-chip grok">Grok</span>
-          <strong>{title}</strong>
-          <span className="flow-turn">{step.turn}</span>
-          <button type="button" className="flow-log" onClick={planLog}>判断のログ</button>
-        </header>
-        <section className="flow-part">
-          <h4>理由</h4>
-          <MarkdownBody text={decision.reasoning} />
-        </section>
-        {kind === "dispatch" && (
-          <>
-            <div className="flow-route">
-              <span className="flow-arrow" aria-hidden="true">→</span>
-              <span className={`agent-chip ${target?.kind ?? "custom"}`}>{agentName(agents, decision.targetAgent)}</span>
-            </div>
-            {decision.convertedPrompt && (
-              <details className="flow-prompt">
-                <summary>プロンプト</summary>
-                <pre>{decision.convertedPrompt}</pre>
-              </details>
-            )}
-            {step.run && (
-              <RunBlock
-                run={step.run}
-                onLog={() =>
-                  onOpenLog({ nodeId: step.run!.nodeId, title: `${agentName(agents, step.run!.agentId)} · ${title}` })
-                }
-              />
-            )}
-          </>
-        )}
-        {kind === "complete" && decision.summary && (
-          <section className="flow-part flow-summary">
-            <h4>結果</h4>
-            <MarkdownBody text={decision.summary} />
-          </section>
-        )}
-        {kind === "askHuman" && decision.question && (
-          <section className="flow-part flow-question">
-            <h4>質問</h4>
-            <MarkdownBody text={decision.question} />
-          </section>
-        )}
-      </article>
-      {step.reply && (
-        <article className="bubble user">
-          <MarkdownBody text={step.reply} />
-        </article>
-      )}
-    </>
-  );
-});
-
-function ThinkingCard({ turn, onLog }: { turn: number; onLog: () => void }) {
-  return (
-    <article className="flow-card thinking">
+    <article className={failed ? "flow-card fail" : "flow-card"} data-status={run.status}>
       <header className="flow-head">
-        <StatusBadge badge="spin" label="判断中" />
-        <span className="agent-chip grok">Grok</span>
-        <strong>判断</strong>
-        <span className="flow-turn">{turn}</span>
-        <button type="button" className="flow-log" onClick={onLog}>ログ</button>
+        <StatusBadge badge={runBadge(run.status)} label={RUN_STATUS_LABEL[run.status]} />
+        <span className={`agent-chip ${agentKind(agents, run.agentId)}`}>{who}</span>
+        <strong title={run.title}>{run.title || "無題"}</strong>
+        <span className={`source-chip ${run.source}`}>{SOURCE_LABEL[run.source]}</span>
+        <button
+          type="button"
+          className="flow-log"
+          onClick={() => actions.onOpenLog({ nodeId: run.id, title: `${who} · ${run.title || run.id}` })}
+        >
+          ログ
+        </button>
       </header>
-    </article>
-  );
-}
-
-function RunBlock({ run, onLog }: { run: RunRecord; onLog: () => void }) {
-  const seconds = run.endedAt ? Math.max(0, Math.round((run.endedAt - run.startedAt) / 1000)) : null;
-  return (
-    <section className="flow-run" data-status={run.status}>
-      <header className="flow-head">
-        <StatusBadge badge={nodeBadge(run.status)} label={NODE_STATUS_LABEL[run.status]} />
-        <strong>{NODE_STATUS_LABEL[run.status]}</strong>
+      <div className="flow-status">
+        <span>{RUN_STATUS_LABEL[run.status]}</span>
         {typeof run.exitCode === "number" && <span className="flow-meta">終了コード {run.exitCode}</span>}
         {seconds !== null && <span className="flow-meta">{formatSeconds(seconds)}</span>}
-        <button type="button" className="flow-log" onClick={onLog}>ログ</button>
-      </header>
+        {run.status === "running" && (
+          <span className="flow-actions">
+            <button type="button" className="pill" onClick={() => actions.onCancel(run.id)}>
+              止める
+            </button>
+            <button type="button" className="pill danger" onClick={() => actions.onKill(run.id)}>
+              緊急停止
+            </button>
+          </span>
+        )}
+        {run.status === "queued" && (
+          <span className="flow-actions">
+            <button type="button" className="pill" onClick={() => actions.onCancel(run.id)}>
+              取り消す
+            </button>
+          </span>
+        )}
+      </div>
+      <details className="flow-prompt">
+        <summary>プロンプト</summary>
+        <pre>{run.prompt}</pre>
+      </details>
       {run.summary && (
         <div className="flow-result">
           <MarkdownBody text={run.summary} />
         </div>
       )}
-      {run.diffStat && <pre className="flow-diff">{run.diffStat}</pre>}
-      {run.untracked.length > 0 && (
-        <ul className="flow-files">
-          {run.untracked.map((path) => (
-            <li key={path} className="path">+ {path}</li>
-          ))}
-        </ul>
+      {showError && run.error && (
+        <p className="flow-error">
+          {ERROR_KIND_LABEL[run.error.kind]}
+          {errorText ? `: ${errorText}` : ""}
+        </p>
       )}
-    </section>
+      {run.denied.length > 0 && (
+        <section className="flow-part">
+          <h4>拒否された操作</h4>
+          <ul className="flow-denied">
+            {run.denied.map((item, index) => (
+              <li key={index}>{item}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {run.changedFiles.length > 0 && (
+        <details className="flow-prompt" open={run.changedFiles.length <= 12}>
+          <summary>変更したファイル {run.changedFiles.length} 件</summary>
+          <ul className="flow-files">
+            {run.changedFiles.map((file) => {
+              const change = FILE_CHANGE_MARK[file.change] ?? { mark: "?", label: file.change };
+              return (
+                <li key={`${file.change}:${file.path}`} className={`path ${file.change}`}>
+                  <span className="file-mark" title={change.label}>{change.mark}</span>
+                  <span className="file-path">{file.path}</span>
+                  {(typeof file.added === "number" || typeof file.deleted === "number") && (
+                    <span className="file-count">
+                      {typeof file.added === "number" && <span className="plus">+{file.added}</span>}
+                      {typeof file.deleted === "number" && <span className="minus">-{file.deleted}</span>}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      )}
+      {run.diffStat && <pre className="flow-diff">{lastLine(run.diffStat)}</pre>}
+      {run.truncated && <p className="flow-meta">差分の一部を省略しました</p>}
+      {run.recoveryPoint && <RecoveryPoint hash={run.recoveryPoint} />}
+    </article>
+  );
+});
+
+function RecoveryPoint({ hash }: { hash: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <p className="flow-recovery">
+      <span className="flow-meta">作業前</span>
+      <code title={hash}>{hash.slice(0, 12)}</code>
+      <button
+        type="button"
+        className="flow-log"
+        onClick={() => {
+          void navigator.clipboard
+            .writeText(hash)
+            .then(() => setCopied(true))
+            .catch(() => setCopied(false));
+        }}
+      >
+        {copied ? "コピーしました" : "コピー"}
+      </button>
+    </p>
   );
 }
 
-function formatSeconds(total: number) {
-  if (total < 60) return `${total}秒`;
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return seconds ? `${minutes}分${seconds}秒` : `${minutes}分`;
+function lastLine(text: string) {
+  const lines = text.trimEnd().split(/\r?\n/);
+  return (lines[lines.length - 1] ?? "").trim();
 }
 
 export function LogDrawer({

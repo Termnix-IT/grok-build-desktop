@@ -8,22 +8,26 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { MarkdownBody } from "./MarkdownBody";
 import { AgentSettings } from "./AgentSettings";
-import { FlowTimeline, LogDrawer, StatusBadge, type LogTarget } from "./OrchestraView";
+import { GatewaySettings } from "./GatewaySettings";
+import { LogDrawer, StatusBadge, TaskTimeline, type LogTarget } from "./OrchestraView";
 import {
+  type GatewayView,
+  type HubSnapshot,
   type LogLine,
   type OrchestraAction,
   type OrchestraState,
-  type Preflight,
   type Registry,
+  type Submitted,
   type TaskRecord,
-  TASK_STATUS_LABEL,
+  RUN_STATUS_LABEL,
+  agentName,
   initialOrchestra,
-  isLive,
-  liveTask,
-  plannerSessions,
+  liveRun,
   projectTasks,
+  queuedRuns,
   reduceOrchestra,
-  stepLabel,
+  runBadge,
+  taskActive,
   taskBadge,
 } from "./orchestra";
 import {
@@ -52,14 +56,16 @@ const CONTEXT_KEY = "gbd-context-open";
 const AUTO_KEY = "gbd-auto-approve";
 const MOTION_KEY = "gbd-motion";
 const FLOW_KEY = "gbd-flow-mode";
+const FLOW_AGENT_KEY = "gbd-flow-agent";
 
 type TranscriptView = "chat" | "thought" | "all";
-type SettingsPage = "display" | "approval" | "agents" | "usage" | "commands" | "app";
+type SettingsPage = "display" | "approval" | "agents" | "gateway" | "usage" | "commands" | "app";
 
 const SETTINGS_PAGES: { id: SettingsPage; label: string }[] = [
   { id: "display", label: "表示" },
   { id: "approval", label: "自動承認" },
   { id: "agents", label: "エージェント" },
+  { id: "gateway", label: "連携" },
   { id: "usage", label: "使用量" },
   { id: "commands", label: "コマンド一覧" },
   { id: "app", label: "このアプリ" },
@@ -186,11 +192,6 @@ function readList(key: string) {
   }
 }
 
-function firstLine(text: string) {
-  const line = text.split(/\r?\n/).find((item) => item.trim()) ?? text;
-  return line.trim().slice(0, 80);
-}
-
 function rememberFolder(path: string) {
   const recent = [path, ...readList(RECENT_KEY).filter((item) => item !== path)].slice(0, 8);
   localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
@@ -225,13 +226,17 @@ export default function App() {
   const [hasUpdate, setHasUpdate] = useState(false);
   const [pendingApply, setPendingApply] = useState(false);
   const [flowMode, setFlowMode] = useState(() => localStorage.getItem(FLOW_KEY) === "1");
+  const [flowAgent, setFlowAgent] = useState(() => localStorage.getItem(FLOW_AGENT_KEY) ?? "");
   const [orch, setOrch] = useState<OrchestraState>(initialOrchestra);
   const [registry, setRegistry] = useState<Registry | null>(null);
   const [logTarget, setLogTarget] = useState<LogTarget | null>(null);
-  const [pendingStart, setPendingStart] = useState<{ goal: string; preflight: Preflight } | null>(null);
   const [pendingTaskDelete, setPendingTaskDelete] = useState<string | null>(null);
   const [openTasks, setOpenTasks] = useState<string[]>([]);
+  const [hubBusy, setHubBusy] = useState(false);
   const flowSendingRef = useRef(false);
+  const orchRef = useRef(orch);
+  orchRef.current = orch;
+  const pushOrchRef = useRef<(event: Record<string, unknown> | OrchestraAction) => void>(() => {});
   const transcriptRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const stickRef = useRef(true);
@@ -283,30 +288,82 @@ export default function App() {
 
   useEffect(() => {
     let frame = 0;
-    const queue: (Record<string, unknown> | OrchestraAction)[] = [];
+    let timer = 0;
+    // Every change to the hub state goes through this queue, so a list fetched earlier is
+    // applied in order with the events that arrived around it.
+    const queue: { event: Record<string, unknown> | OrchestraAction; at: number }[] = [];
     const flush = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      if (timer) window.clearTimeout(timer);
       frame = 0;
+      timer = 0;
       const batch = queue.splice(0);
       if (batch.length === 0) return;
-      setOrch((current) => batch.reduce((state, event) => reduceOrchestra(state, event), current));
+      setOrch((current) => batch.reduce((state, item) => reduceOrchestra(state, item.event, item.at), current));
     };
     const push = (event: Record<string, unknown> | OrchestraAction) => {
-      queue.push(event);
+      queue.push({ event, at: Date.now() });
+      if (queue.length >= 500) {
+        flush();
+        return;
+      }
+      // A minimized window gets no animation frames, so a timer flushes the queue too.
       if (!frame) frame = window.requestAnimationFrame(flush);
+      if (!timer) timer = window.setTimeout(flush, 250);
     };
-    const stopEvents = listen<Record<string, unknown>>("orchestrator://event", (event) => push(event.payload));
+    pushOrchRef.current = push;
+    const known = new Set<string>();
+    const fetching = new Set<string>();
+    const stale = new Set<string>();
+    // A job event that arrives while the task is being fetched may be newer than the answer,
+    // and the answer is then dropped as older, so the task is fetched once more.
+    const fetchTask = (taskId: string) => {
+      fetching.add(taskId);
+      stale.delete(taskId);
+      const requestedAt = Date.now();
+      void invoke<TaskRecord | null>("orchestrator_task", { taskId })
+        .then((task) => {
+          if (!task) return;
+          known.add(task.id);
+          push({ type: "tasks-loaded", project: null, tasks: [task], requestedAt });
+        })
+        .catch(() => {})
+        .finally(() => {
+          fetching.delete(taskId);
+          if (stale.has(taskId)) fetchTask(taskId);
+        });
+    };
+    const stopEvents = listen<Record<string, unknown>>("orchestrator://event", (event) => {
+      const payload = event.payload;
+      if (payload.type === "task") {
+        const task = payload.task as TaskRecord | undefined;
+        if (task?.id) known.add(task.id);
+      }
+      push(payload);
+      // A job of a task this screen has not loaded (another folder, or a reloaded screen) fetches its task.
+      const taskId = payload.type === "run" && typeof payload.taskId === "string" ? payload.taskId : "";
+      if (!taskId) return;
+      if (fetching.has(taskId)) stale.add(taskId);
+      else if (!known.has(taskId) && !orchRef.current.tasks[taskId]) fetchTask(taskId);
+    });
     const stopLogs = listen<{ nodeId?: string; lines?: LogLine[] }>("agent://log", (event) => {
       const { nodeId, lines } = event.payload;
       if (typeof nodeId === "string" && Array.isArray(lines)) push({ type: "log-batch", nodeId, lines });
     });
-    void invoke<{ live?: TaskRecord | null }>("orchestrator_snapshot")
+    const requestedAt = Date.now();
+    void invoke<HubSnapshot>("orchestrator_snapshot")
       .then((snapshot) => {
-        if (snapshot?.live) push({ type: "task", task: snapshot.live });
+        if (snapshot?.active?.length) push({ type: "tasks-loaded", project: null, tasks: snapshot.active, requestedAt });
+        if (snapshot?.gateway) {
+          push({ type: "gateway", status: snapshot.gateway.status, accepting: snapshot.gateway.accepting, rejected: null });
+        }
       })
       .catch(() => {});
     void invoke<Registry>("agents_config_get").then(setRegistry).catch(() => {});
     return () => {
+      pushOrchRef.current = () => {};
       if (frame) window.cancelAnimationFrame(frame);
+      if (timer) window.clearTimeout(timer);
       void stopEvents.then((stop) => stop());
       void stopLogs.then((stop) => stop());
     };
@@ -315,9 +372,10 @@ export default function App() {
   useEffect(() => {
     if (!folder) return;
     let cancelled = false;
+    const requestedAt = Date.now();
     void invoke<TaskRecord[]>("orchestrator_tasks", { project: folder })
       .then((tasks) => {
-        if (!cancelled) setOrch((current) => reduceOrchestra(current, { type: "tasks-loaded", project: folder, tasks }));
+        if (!cancelled) pushOrchRef.current({ type: "tasks-loaded", project: folder, tasks, requestedAt });
       })
       .catch(() => {});
     return () => {
@@ -403,14 +461,13 @@ export default function App() {
     };
   }, []);
 
-  const viewTask = orch.activeTaskId ? orch.tasks[orch.activeTaskId] ?? null : null;
-  const viewPlanning = viewTask ? orch.planning[viewTask.id] ?? null : null;
+  const viewTask = flowMode && orch.activeTaskId ? orch.tasks[orch.activeTaskId] ?? null : null;
 
   useEffect(() => {
     const box = transcriptRef.current;
     if (!box || !stickRef.current) return;
     box.scrollTop = box.scrollHeight;
-  }, [desk.items, desk.permission, desk.busy, viewTask, viewPlanning]);
+  }, [desk.items, desk.permission, desk.busy, viewTask]);
 
   useEffect(() => {
     const field = inputRef.current;
@@ -675,33 +732,29 @@ export default function App() {
     void submit(draft, files, images);
   }
 
-  function flowError(error: unknown) {
+  const flowError = useCallback((error: unknown) => {
     setDesk((current) => ({ ...current, error: errorText(error) }));
-  }
+  }, []);
 
   async function sendFlow() {
     const text = draft.trim();
-    if (!text || flowSendingRef.current) return;
+    const project = viewTask?.project ?? folder;
+    if (!text || !project || !flowAgentReady || flowSendingRef.current) return;
+    if (viewTask && viewTask.status !== "open") return;
     flowSendingRef.current = true;
     try {
-      if (viewTask && (viewTask.status === "waiting" || viewTask.status === "paused")) {
-        await invoke("orchestrator_answer", { taskId: viewTask.id, text });
-        stickRef.current = true;
-        setDraft("");
-        setSuggestions([]);
-        return;
-      }
-      if (!folder) return;
-      const preflight = await invoke<Preflight>("orchestrator_preflight", { project: folder });
-      if (!preflight.isGit || !preflight.hasCommit) {
-        flowError("git のリポジトリで、1 つ以上のコミットがあるフォルダを選んでください");
-        return;
-      }
-      if (preflight.dirty) {
-        setPendingStart({ goal: text, preflight });
-        return;
-      }
-      await beginTask(text);
+      const submitted = await invoke<Submitted>("orchestrator_dispatch", {
+        project,
+        agentId: flowAgent,
+        prompt: text,
+        taskId: viewTask?.id,
+      });
+      stickRef.current = true;
+      setDraft("");
+      setSuggestions([]);
+      setDesk((current) => ({ ...current, error: "" }));
+      setOrch((current) => reduceOrchestra(current, { type: "select", id: submitted.taskId }));
+      setOpenTasks((current) => (current.includes(submitted.taskId) ? current : [...current, submitted.taskId]));
     } catch (error) {
       flowError(error);
     } finally {
@@ -709,29 +762,68 @@ export default function App() {
     }
   }
 
-  async function beginTask(goal: string) {
-    setPendingStart(null);
+  function chooseFlowAgent(id: string) {
+    setFlowAgent(id);
+    localStorage.setItem(FLOW_AGENT_KEY, id);
+  }
+
+  async function hubCall(command: string, args?: Record<string, unknown>) {
+    setHubBusy(true);
     try {
-      const id = await invoke<string>("orchestrator_start", { project: folder, goal });
-      stickRef.current = true;
-      setDraft("");
-      setSuggestions([]);
-      setLogTarget(null);
-      setDesk((current) => ({ ...current, error: "" }));
-      setOrch((current) => reduceOrchestra(current, { type: "select", id }));
-      setOpenTasks((current) => (current.includes(id) ? current : [...current, id]));
+      await invoke(command, args);
     } catch (error) {
       flowError(error);
+    } finally {
+      setHubBusy(false);
     }
   }
 
-  function abortLoop(taskId: string) {
-    void invoke("orchestrator_abort", { taskId }).catch(flowError);
+  const cancelJob = useCallback(
+    (jobId: string) => {
+      void invoke("orchestrator_cancel", { jobId }).catch(flowError);
+    },
+    [flowError],
+  );
+
+  const killJob = useCallback(
+    (jobId: string) => {
+      void invoke("orchestrator_kill", { jobId }).catch(flowError);
+    },
+    [flowError],
+  );
+
+  const resumeTask = useCallback((taskId: string) => {
+    void hubCall("orchestrator_resume", { taskId });
+    // hubCall only reads stable setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const closeTask = useCallback((taskId: string) => {
+    void hubCall("orchestrator_close", { taskId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function toggleAccepting(accepting: boolean) {
+    setHubBusy(true);
+    try {
+      const view = await invoke<GatewayView>("gateway_get");
+      if (accepting && view.allowedProjects.length === 0) {
+        setSettingsPage("gateway");
+        setSettingsOpen(true);
+        return;
+      }
+      await invoke("gateway_save", { accepting, allowedProjects: view.allowedProjects });
+    } catch (error) {
+      flowError(error);
+    } finally {
+      setHubBusy(false);
+    }
   }
 
   function selectTask(id: string | null) {
     if (id !== orch.activeTaskId) setLogTarget(null);
     stickRef.current = true;
+    if (id) chooseFlowMode(true);
     setOrch((current) => reduceOrchestra(current, { type: "select", id }));
   }
 
@@ -739,27 +831,33 @@ export default function App() {
     setOpenTasks((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
   }
 
-  function openLog(target: LogTarget) {
+  const openLog = useCallback((target: LogTarget) => {
     setLogTarget(target);
     void invoke<LogLine[]>("agent_log", { nodeId: target.nodeId })
       .then((lines) => setOrch((current) => reduceOrchestra(current, { type: "logs-loaded", nodeId: target.nodeId, lines })))
       .catch(() => {});
-  }
+  }, []);
 
   function deleteTask(id: string) {
     setPendingTaskDelete(null);
+    const runs = new Set(orch.tasks[id]?.runs.map((run) => run.id) ?? []);
     void invoke("orchestrator_delete", { taskId: id })
       .then(() => {
-        if (logTarget && orch.tasks[id]?.steps.some((step) => logTarget.nodeId.startsWith(step.id))) setLogTarget(null);
-        setOrch((current) => reduceOrchestra(current, { type: "task-removed", id }));
+        setLogTarget((current) => (current && runs.has(current.nodeId) ? null : current));
+        pushOrchRef.current({ type: "task-removed", id });
       })
       .catch(flowError);
   }
 
+  /** What is on screen decides where the text goes, so the mode follows the screen. */
   function chooseFlowMode(enabled: boolean) {
     setFlowMode(enabled);
     localStorage.setItem(FLOW_KEY, enabled ? "1" : "0");
     setSuggestions([]);
+    if (!enabled) {
+      setLogTarget(null);
+      setOrch((current) => (current.activeTaskId ? reduceOrchestra(current, { type: "select", id: null }) : current));
+    }
   }
 
   function askUsage() {
@@ -844,7 +942,7 @@ export default function App() {
 
   async function load(id: string) {
     setPendingLoad(null);
-    selectTask(null);
+    chooseFlowMode(false);
     stickRef.current = true;
     setDesk((current) => ({
       ...current,
@@ -865,8 +963,8 @@ export default function App() {
   }
 
   function startSession() {
-    selectTask(null);
     if (flowMode) {
+      selectTask(null);
       inputRef.current?.focus();
       return;
     }
@@ -919,24 +1017,27 @@ export default function App() {
   }, []);
 
   const orchTasks = orch.tasks;
-  const hiddenSessions = useMemo(() => plannerSessions(orchTasks), [orchTasks]);
   const visibleSessions = useMemo(() => {
     const needle = sessionFilter.trim().toLowerCase();
-    const chats = desk.sessions.filter((session) => !hiddenSessions.has(session.sessionId));
-    if (!needle) return chats;
-    return chats.filter((session) => (session.title || "無題").toLowerCase().includes(needle));
-  }, [desk.sessions, sessionFilter, hiddenSessions]);
+    if (!needle) return desk.sessions;
+    return desk.sessions.filter((session) => (session.title || "無題").toLowerCase().includes(needle));
+  }, [desk.sessions, sessionFilter]);
   const visibleTasks = useMemo(() => {
     const needle = sessionFilter.trim().toLowerCase();
     const tasks = projectTasks(orchTasks, folder);
     if (!needle) return tasks;
-    return tasks.filter((task) => task.goal.toLowerCase().includes(needle));
+    return tasks.filter(
+      (task) =>
+        task.title.toLowerCase().includes(needle) || task.runs.some((run) => run.title.toLowerCase().includes(needle)),
+    );
   }, [orchTasks, folder, sessionFilter]);
-  const live = useMemo(() => liveTask(orchTasks), [orchTasks]);
-  const agents = registry?.agents ?? [];
-  const flowAnswering = Boolean(viewTask && (viewTask.status === "waiting" || viewTask.status === "paused"));
-  const flowBlocked = Boolean(live && !(flowAnswering && viewTask?.id === live.id));
-  const shownTask = viewTask ?? live;
+  const live = useMemo(() => liveRun(orchTasks), [orchTasks]);
+  const waiting = useMemo(() => queuedRuns(orchTasks).length, [orchTasks]);
+  const agents = useMemo(() => registry?.agents ?? [], [registry]);
+  const flowAgents = agents.filter((agent) => agent.enabled);
+  const flowAgentReady = flowAgents.some((agent) => agent.id === flowAgent);
+  const gateway = orch.gateway;
+  const gatewayValue = gateway.status?.state === "failed" ? "failed" : gateway.accepting ? "on" : "off";
   const folders = useMemo(() => {
     const seen = new Set<string>();
     const list: string[] = [];
@@ -952,24 +1053,31 @@ export default function App() {
     () => desk.items.filter((item) => showsTranscriptItem(item, transcriptView)),
     [desk.items, transcriptView],
   );
-  const openTitle = viewTask
-    ? firstLine(viewTask.goal)
+  const openTitle = flowMode
+    ? viewTask
+      ? viewTask.title || "無題"
+      : ""
     : desk.sessions.find((session) => session.sessionId === desk.sessionId)?.title ||
       (desk.sessionId ? "無題" : "");
-  const showWelcome = !viewTask && !desk.sessionId && !desk.loading && desk.items.length === 0;
+  const showWelcome = flowMode
+    ? !viewTask && !folder
+    : !desk.sessionId && !desk.loading && desk.items.length === 0;
+  const flowProject = viewTask?.project ?? folder;
   const composeReady = flowMode
-    ? !desk.loading && Boolean(folder) && !flowBlocked
+    ? Boolean(flowProject) && flowAgentReady && (!viewTask || viewTask.status === "open")
     : !desk.loading && (Boolean(desk.sessionId) || Boolean(folder));
   const placeholder = flowMode
-    ? !folder
+    ? !flowProject
       ? "プロジェクトを選択"
-      : flowAnswering
-        ? viewTask?.status === "waiting"
-          ? "返事"
-          : "再開の指示"
-        : live
-          ? "別のタスクが動いています"
-          : "目的"
+      : !flowAgentReady
+        ? "エージェントを選択"
+        : viewTask?.status === "paused"
+          ? "一時停止中"
+          : viewTask?.status === "closed"
+            ? "終了したタスク"
+            : viewTask
+              ? "続きの依頼"
+              : "依頼"
     : composeReady
       ? "メッセージ"
       : "プロジェクトを選択";
@@ -1032,8 +1140,9 @@ export default function App() {
                 <div className={open ? "tree-fold open" : "tree-fold"} inert={!open}>
                   <ul className="tree">
                     {selected && visibleTasks.map((task) => {
-                      const on = task.id === orch.activeTaskId;
-                      const expanded = openTasks.includes(task.id) && task.steps.length > 0;
+                      const on = flowMode && task.id === orch.activeTaskId;
+                      const expanded = openTasks.includes(task.id) && task.runs.length > 0;
+                      const mark = taskBadge(task);
                       return (
                         <Fragment key={task.id}>
                           <li className={on ? "tree-row task on" : "tree-row task"}>
@@ -1042,7 +1151,7 @@ export default function App() {
                               className={expanded ? "task-twist open" : "task-twist"}
                               aria-label={expanded ? "畳む" : "開く"}
                               aria-expanded={expanded}
-                              disabled={task.steps.length === 0}
+                              disabled={task.runs.length === 0}
                               onClick={() => toggleTaskOpen(task.id)}
                             >
                               <svg width="11" height="11" viewBox="0 0 15 15" aria-hidden="true">
@@ -1052,40 +1161,40 @@ export default function App() {
                             <button
                               type="button"
                               className="session"
-                              title={task.goal}
+                              title={task.title}
                               onClick={() => {
                                 selectTask(task.id);
                                 setOpenTasks((current) => (current.includes(task.id) ? current : [...current, task.id]));
                               }}
                             >
-                              <StatusBadge badge={taskBadge(task.status)} label={TASK_STATUS_LABEL[task.status]} />
-                              <strong>{firstLine(task.goal) || "無題"}</strong>
+                              <StatusBadge badge={mark.badge} label={mark.label} />
+                              <strong>{task.title || "無題"}</strong>
                             </button>
-                            {!isLive(task.status) && (
+                            {!taskActive(task) && (
                               <button type="button" className="icon" aria-label="削除" onClick={() => setPendingTaskDelete(task.id)}>
                                 ×
                               </button>
                             )}
                           </li>
                           {expanded &&
-                            task.steps.map((step) => {
-                              const label = stepLabel(step, agents);
-                              const nodeId = step.run?.nodeId ?? step.planNodeId;
-                              const nodeOn = logTarget?.nodeId === nodeId;
+                            task.runs.map((run) => {
+                              const who = agentName(agents, run.agentId);
+                              const what = run.title || "無題";
+                              const nodeOn = logTarget?.nodeId === run.id;
                               return (
-                                <li key={step.id} className={nodeOn ? "tree-row node on" : "tree-row node"}>
+                                <li key={run.id} className={nodeOn ? "tree-row node on" : "tree-row node"}>
                                   <button
                                     type="button"
                                     className="session"
-                                    title={`${label.who} · ${label.what}`}
+                                    title={`${who} · ${what}`}
                                     onClick={() => {
                                       selectTask(task.id);
-                                      openLog({ nodeId, title: `${label.who} · ${label.what}` });
+                                      openLog({ nodeId: run.id, title: `${who} · ${what}` });
                                     }}
                                   >
-                                    <StatusBadge badge={label.badge} />
-                                    <span className="node-who">[{label.who}]</span>
-                                    <span className="node-what">{label.what}</span>
+                                    <StatusBadge badge={runBadge(run.status)} label={RUN_STATUS_LABEL[run.status]} />
+                                    <span className="node-who">[{who}]</span>
+                                    <span className="node-what">{what}</span>
                                   </button>
                                 </li>
                               );
@@ -1094,7 +1203,7 @@ export default function App() {
                       );
                     })}
                     {selected && visibleSessions.map((session) => {
-                      const on = !viewTask && session.sessionId === desk.sessionId;
+                      const on = !flowMode && session.sessionId === desk.sessionId;
                       return (
                         <li key={session.sessionId} className={on ? "tree-row on" : "tree-row"}>
                           <button
@@ -1190,8 +1299,19 @@ export default function App() {
                 stickRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
               }}
             >
-              {viewTask ? (
-                <FlowTimeline task={viewTask} agents={agents} planning={viewPlanning} onOpenLog={openLog} />
+              {flowMode ? (
+                viewTask && (
+                  <TaskTimeline
+                    task={viewTask}
+                    agents={agents}
+                    busy={hubBusy}
+                    onResume={resumeTask}
+                    onClose={closeTask}
+                    onOpenLog={openLog}
+                    onCancel={cancelJob}
+                    onKill={killJob}
+                  />
+                )
               ) : (
                 <>
                   {shownItems.map((item) => (
@@ -1299,10 +1419,16 @@ export default function App() {
                   <PlusIcon />
                 </button>
                 <span className="composer-spacer" />
-                {flowMode && live && (
-                  <button type="button" className="loop-stop" onClick={() => abortLoop(live.id)}>
+                {flowMode && (live || waiting > 0) && (
+                  <button
+                    type="button"
+                    className="loop-stop"
+                    disabled={hubBusy}
+                    title="実行中のジョブを止め、待ちを取り消し、Grok Bot の受付を止めます"
+                    onClick={() => void hubCall("orchestrator_stop_all")}
+                  >
                     <span className="stop-mark" aria-hidden="true" />
-                    ループを止める
+                    緊急停止
                   </button>
                 )}
                 {!flowMode && desk.busy ? (
@@ -1330,21 +1456,41 @@ export default function App() {
                   disabled={false}
                   choices={[
                     { value: "chat", label: "チャット" },
-                    { value: "flow", label: "自律実行" },
+                    { value: "flow", label: "連携" },
                   ]}
                   onChange={(value) => chooseFlowMode(value === "flow")}
                 />
                 {flowMode ? (
-                  <span className="flow-indicator" data-status={shownTask?.status ?? "idle"}>
-                    {shownTask ? (
-                      <>
-                        <StatusBadge badge={taskBadge(shownTask.status)} />
-                        {TASK_STATUS_LABEL[shownTask.status]}
-                      </>
-                    ) : (
-                      "待機"
+                  <>
+                    <QuietSelect
+                      label="Grok Bot"
+                      value={gatewayValue}
+                      align="left"
+                      disabled={hubBusy || gatewayValue === "failed"}
+                      choices={
+                        gatewayValue === "failed"
+                          ? [{ value: "failed", label: "パイプ失敗" }]
+                          : [
+                              { value: "on", label: "受付中" },
+                              { value: "off", label: "受付停止" },
+                            ]
+                      }
+                      onChange={(value) => void toggleAccepting(value === "on")}
+                    />
+                    {live && (
+                      <button
+                        type="button"
+                        className="flow-indicator"
+                        data-status="running"
+                        title={live.run.title || live.task.title}
+                        onClick={() => selectTask(live.task.id)}
+                      >
+                        <StatusBadge badge="spin" label={RUN_STATUS_LABEL.running} />
+                        {agentName(agents, live.run.agentId)}
+                        {waiting > 0 && <span className="flow-turns">+{waiting}</span>}
+                      </button>
                     )}
-                  </span>
+                  </>
                 ) : (
                   <QuietSelect
                     label={desk.modeConfirmed ? "権限" : "未確認"}
@@ -1359,7 +1505,21 @@ export default function App() {
                 )}
               </div>
               {flowMode ? (
-                <span className="flow-turns">{shownTask ? `${shownTask.turn} / ${shownTask.maxTurns}` : ""}</span>
+                <div className="meta-configs">
+                  {viewTask && (
+                    <span className="flow-turns" title="このタスクのジョブの数と上限">
+                      {viewTask.dispatches} / {viewTask.dispatchLimit}
+                    </span>
+                  )}
+                  <QuietSelect
+                    label="エージェント"
+                    value={flowAgentReady ? flowAgent : ""}
+                    align="right"
+                    disabled={flowAgents.length === 0}
+                    choices={flowAgents.map((agent) => ({ value: agent.id, label: agent.name || agent.id }))}
+                    onChange={chooseFlowAgent}
+                  />
+                </div>
               ) : (
               <div className="meta-configs">
                 {(() => {
@@ -1543,6 +1703,7 @@ export default function App() {
                 </div>
               )}
               {settingsPage === "agents" && <AgentSettings registry={registry} onChange={setRegistry} />}
+              {settingsPage === "gateway" && <GatewaySettings folders={folders} live={gateway} />}
               {settingsPage === "usage" && (
                 <>
                   <h3>Grok の使用量</h3>
@@ -1629,27 +1790,11 @@ export default function App() {
           </section>
         </div>
       )}
-      {pendingStart && (
-        <div className="modal">
-          <section>
-            <h3>未コミットの変更があります</h3>
-            <p>
-              エージェントは、この変更が残ったままのフォルダ
-              {pendingStart.preflight.branch ? `（${pendingStart.preflight.branch}）` : ""}
-              で作業します。作業前からある変更は、各ステップの差分に含めません。
-            </p>
-            <div className="modal-actions">
-              <button type="button" onClick={() => setPendingStart(null)}>やめる</button>
-              <button className="solid" type="button" onClick={() => void beginTask(pendingStart.goal)}>始める</button>
-            </div>
-          </section>
-        </div>
-      )}
       {pendingTaskDelete && (
         <div className="modal">
           <section>
             <h3>このタスクの記録を削除しますか</h3>
-            <p>判断と結果の記録を消します。プロジェクトのファイルと、各 CLI のセッションは残ります。</p>
+            <p>ジョブの結果とログを消します。プロジェクトのファイルと、各 CLI のセッションは残ります。</p>
             <div className="modal-actions">
               <button type="button" onClick={() => setPendingTaskDelete(null)}>やめる</button>
               <button className="solid danger" type="button" onClick={() => deleteTask(pendingTaskDelete)}>

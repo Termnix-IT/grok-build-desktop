@@ -4,6 +4,7 @@ version = "0.0.5"
 description = "Desktop ACP client for the installed Grok Build"
 authors = ["Termnix-IT"]
 edition = "2024"
+default-run = "grok-build-desktop"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -30,7 +31,7 @@ tauri-plugin-updater = "2.14.0"
 uuid = { version = "1.28", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_Environment", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
