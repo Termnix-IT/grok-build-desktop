@@ -18,9 +18,8 @@ pub fn review(tool: &Value, options: &Value, folder: Option<&Path>) -> Review {
     let reason = match action_of(tool) {
         Action::Allow => String::new(),
         Action::Edit => edit_reason(tool, folder).unwrap_or_default(),
-        Action::Execute => {
-            execute_reason(&command_text(tool.get("rawInput")).unwrap_or_default()).unwrap_or_default()
-        }
+        Action::Execute => execute_reason(&command_text(tool.get("rawInput")).unwrap_or_default())
+            .unwrap_or_default(),
         Action::Ask(reason) => reason.to_string(),
     };
     let allow_once = if reason.is_empty() {
@@ -73,7 +72,12 @@ fn action_of(tool: &Value) -> Action {
     if kind == "switch_mode" || name.contains("switch_mode") {
         return Action::Ask("セッションのモードを変えます");
     }
-    if kind == "edit" || matches!(name.as_str(), "edit" | "write" | "apply_patch" | "strreplace") {
+    if kind == "edit"
+        || matches!(
+            name.as_str(),
+            "edit" | "write" | "apply_patch" | "strreplace"
+        )
+    {
         return Action::Edit;
     }
     if matches!(kind, "read" | "search" | "think")
@@ -155,7 +159,15 @@ fn collect_paths(value: Option<&Value>, paths: &mut Vec<String>) {
     let Some(object) = value.and_then(Value::as_object) else {
         return;
     };
-    for key in ["path", "filePath", "file_path", "target", "uri", "absPath", "absolutePath"] {
+    for key in [
+        "path",
+        "filePath",
+        "file_path",
+        "target",
+        "uri",
+        "absPath",
+        "absolutePath",
+    ] {
         if let Some(path) = object.get(key).and_then(Value::as_str) {
             paths.push(path.to_string());
         }
@@ -281,12 +293,8 @@ fn obfuscated(input: &str) -> bool {
     if lower.contains("$(") || input.contains('`') || lower.contains("invoke-expression") {
         return true;
     }
-    loose_tokens(&lower).any(|token| {
-        matches!(
-            token,
-            "iex" | "encodedcommand" | "-encodedcommand" | "-enc"
-        )
-    })
+    loose_tokens(&lower)
+        .any(|token| matches!(token, "iex" | "encodedcommand" | "-encodedcommand" | "-enc"))
 }
 
 fn has_redirect(input: &str) -> bool {
@@ -472,11 +480,20 @@ fn config_reason(args: &[String]) -> Option<&'static str> {
         let lower = arg.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "--unset" | "--unset-all" | "--add" | "--replace-all" | "--edit" | "--remove-section" | "--rename-section"
+            "--unset"
+                | "--unset-all"
+                | "--add"
+                | "--replace-all"
+                | "--edit"
+                | "--remove-section"
+                | "--rename-section"
         ) {
             return Some("Git の設定を変えるコマンドのため、許可が必要です");
         }
-        if matches!(lower.as_str(), "--get" | "--get-all" | "--get-regexp" | "--list" | "-l") {
+        if matches!(
+            lower.as_str(),
+            "--get" | "--get-all" | "--get-regexp" | "--list" | "-l"
+        ) {
             read_flag = true;
         }
     }
@@ -488,29 +505,47 @@ fn config_reason(args: &[String]) -> Option<&'static str> {
 }
 
 fn cargo_reason(args: &[String]) -> Option<&'static str> {
-    match args.first().map(|item| item.to_ascii_lowercase()).as_deref() {
+    match args
+        .first()
+        .map(|item| item.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("check" | "test" | "build" | "clippy" | "fmt" | "metadata" | "tree" | "doc") => None,
-        Some("publish" | "install" | "login" | "yank") => Some("公開や導入を含むため、許可が必要です"),
+        Some("publish" | "install" | "login" | "yank") => {
+            Some("公開や導入を含むため、許可が必要です")
+        }
         _ => Some("この Cargo の操作は自動では許可しません"),
     }
 }
 
 fn go_reason(args: &[String]) -> Option<&'static str> {
-    match args.first().map(|item| item.to_ascii_lowercase()).as_deref() {
+    match args
+        .first()
+        .map(|item| item.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("test" | "build" | "vet") => None,
         _ => Some("この Go の操作は自動では許可しません"),
     }
 }
 
 fn dotnet_reason(args: &[String]) -> Option<&'static str> {
-    match args.first().map(|item| item.to_ascii_lowercase()).as_deref() {
+    match args
+        .first()
+        .map(|item| item.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("build" | "test" | "--version" | "-v") => None,
         _ => Some("この .NET の操作は自動では許可しません"),
     }
 }
 
 fn package_reason(args: &[String]) -> Option<&'static str> {
-    match args.first().map(|item| item.to_ascii_lowercase()).as_deref() {
+    match args
+        .first()
+        .map(|item| item.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("ls" | "list" | "--version" | "-v") => None,
         Some("publish") => Some("公開や導入を含むため、許可が必要です"),
         Some("test" | "run" | "install" | "exec" | "start") => {
@@ -521,7 +556,12 @@ fn package_reason(args: &[String]) -> Option<&'static str> {
 }
 
 fn npx_reason(args: &[String]) -> Option<&'static str> {
-    if args.first().map(|item| item.to_ascii_lowercase()).as_deref() == Some("tsc") {
+    if args
+        .first()
+        .map(|item| item.to_ascii_lowercase())
+        .as_deref()
+        == Some("tsc")
+    {
         return tsc_reason(&args[1..]);
     }
     Some("パッケージのスクリプトを実行するため、許可が必要です")
@@ -538,7 +578,9 @@ fn tsc_reason(args: &[String]) -> Option<&'static str> {
 }
 
 fn version_only(args: &[String]) -> Option<&'static str> {
-    let version = args.iter().any(|arg| arg == "--version" || arg == "-v" || arg == "-V")
+    let version = args
+        .iter()
+        .any(|arg| arg == "--version" || arg == "-v" || arg == "-V")
         && args.iter().all(|arg| arg.starts_with('-'));
     if version {
         None
@@ -586,14 +628,13 @@ fn loose_tokens(input: &str) -> impl Iterator<Item = &str> {
 fn program_name(token: &str) -> String {
     let base = token.rsplit(['\\', '/']).next().unwrap_or(token);
     let lower = base.to_ascii_lowercase();
-    lower
-        .strip_suffix(".exe")
-        .unwrap_or(&lower)
-        .to_string()
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
 }
 
 fn norm_path(path: &str) -> String {
-    path.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+    path.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn within(path: &str, root: &str) -> bool {
@@ -650,8 +691,16 @@ mod tests {
         assert!(allows("think", "think", json!({})));
         assert!(allows("edit", "edit", json!({"filePath": "src/app.tsx"})));
         assert!(allows("execute", "bash", json!({"command": "git status"})));
-        assert!(allows("execute", "bash", json!({"command": "git diff -- src/app.tsx"})));
-        assert!(allows("execute", "bash", json!({"command": "cargo test --lib"})));
+        assert!(allows(
+            "execute",
+            "bash",
+            json!({"command": "git diff -- src/app.tsx"})
+        ));
+        assert!(allows(
+            "execute",
+            "bash",
+            json!({"command": "cargo test --lib"})
+        ));
         assert!(allows(
             "execute",
             "powershell",
@@ -687,41 +736,79 @@ mod tests {
         assert!(reason_of("switch_mode", "switch_mode", json!({})).contains("モード"));
         assert!(reason_of("other", "mystery", json!({})).contains("分からない"));
         assert!(reason_of("execute", "bash", json!({"command": "rm -rf dist"})).contains("削除"));
-        assert!(reason_of(
-            "execute",
-            "bash",
-            json!({"command": "git status && Remove-Item tmp"})
-        )
-        .contains("削除"));
-        assert!(reason_of("execute", "bash", json!({"command": "curl https://example.com"}))
-            .contains("通信"));
-        assert!(reason_of("execute", "bash", json!({"command": "echo hi > out.txt"})).contains("書き出し"));
-        assert!(reason_of("execute", "bash", json!({"command": "echo $(rm)"})).contains("確認できない"));
+        assert!(
+            reason_of(
+                "execute",
+                "bash",
+                json!({"command": "git status && Remove-Item tmp"})
+            )
+            .contains("削除")
+        );
+        assert!(
+            reason_of(
+                "execute",
+                "bash",
+                json!({"command": "curl https://example.com"})
+            )
+            .contains("通信")
+        );
+        assert!(
+            reason_of("execute", "bash", json!({"command": "echo hi > out.txt"}))
+                .contains("書き出し")
+        );
+        assert!(
+            reason_of("execute", "bash", json!({"command": "echo $(rm)"})).contains("確認できない")
+        );
         assert!(reason_of("execute", "bash", json!({})).contains("読めません"));
-        assert!(reason_of("execute", "bash", json!({"command": "git push origin main"})).contains("通信"));
-        assert!(reason_of("execute", "bash", json!({"command": "git reset --hard"})).contains("作業ツリー"));
+        assert!(
+            reason_of(
+                "execute",
+                "bash",
+                json!({"command": "git push origin main"})
+            )
+            .contains("通信")
+        );
+        assert!(
+            reason_of("execute", "bash", json!({"command": "git reset --hard"}))
+                .contains("作業ツリー")
+        );
         assert!(reason_of("execute", "bash", json!({"command": "cargo publish"})).contains("公開"));
-        assert!(reason_of("execute", "bash", json!({"command": "npm test"})).contains("スクリプト"));
-        assert!(reason_of("execute", "bash", json!({"command": "python script.py"})).contains("自動では許可"));
-        assert!(reason_of(
-            "execute",
-            "powershell",
-            json!({"command": "powershell -EncodedCommand abc"})
-        )
-        .contains("確認できない"));
+        assert!(
+            reason_of("execute", "bash", json!({"command": "npm test"})).contains("スクリプト")
+        );
+        assert!(
+            reason_of("execute", "bash", json!({"command": "python script.py"}))
+                .contains("自動では許可")
+        );
+        assert!(
+            reason_of(
+                "execute",
+                "powershell",
+                json!({"command": "powershell -EncodedCommand abc"})
+            )
+            .contains("確認できない")
+        );
     }
 
     #[test]
     fn edits_outside_the_project_ask() {
         let folder = Path::new(r"C:\work\app");
         let inside = review(
-            &tool("edit", "edit", json!({"filePath": r"C:\work\app\src\main.ts"})),
+            &tool(
+                "edit",
+                "edit",
+                json!({"filePath": r"C:\work\app\src\main.ts"}),
+            ),
             &options(),
             Some(folder),
         );
         assert_eq!(inside.allow_once.as_deref(), Some("once"));
         let sibling = review(
-            &tool("edit", "edit", json!({"filePath": r"C:\work\app-other\file.ts"})),
+            &tool(
+                "edit",
+                "edit",
+                json!({"filePath": r"C:\work\app-other\file.ts"}),
+            ),
             &options(),
             Some(folder),
         );

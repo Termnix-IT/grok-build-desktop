@@ -18,14 +18,14 @@ use agent_client_protocol::schema::v1::{
     SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{oneshot, watch, Notify};
+use tokio::sync::{Notify, oneshot, watch};
 
 use crate::usage::{
-    classify_image_bytes, context_window, current_model, decode_image, encode_image,
-    foreign_owner, image_mime_from_name, load_path, parse_active_sessions, prompt_blocks,
-    turn_reported_nothing, usage_from_value, used_tokens, LoadedPath, OutgoingImage, TurnUsage,
+    LoadedPath, OutgoingImage, TurnUsage, classify_image_bytes, context_window, current_model,
+    decode_image, encode_image, foreign_owner, image_mime_from_name, load_path,
+    parse_active_sessions, prompt_blocks, turn_reported_nothing, usage_from_value, used_tokens,
 };
 
 const MODE_WAIT: Duration = Duration::from_millis(800);
@@ -76,23 +76,53 @@ pub struct AttachmentRecord {
 }
 
 enum Cmd {
-    SetFolder { path: String, reply: Reply },
-    NewSession { reply: Reply },
-    LoadSession { id: String, reply: Reply },
-    CloseSession { reply: Reply },
-    Refresh { reply: Reply },
+    SetFolder {
+        path: String,
+        reply: Reply,
+    },
+    NewSession {
+        reply: Reply,
+    },
+    LoadSession {
+        id: String,
+        reply: Reply,
+    },
+    CloseSession {
+        reply: Reply,
+    },
+    Refresh {
+        reply: Reply,
+    },
     Prompt {
         text: String,
         files: Vec<String>,
         image_ids: Vec<String>,
         reply: Reply,
     },
-    Compact { reply: Reply },
-    Cancel { reply: Reply },
-    SetMode { mode_id: String, reply: Reply },
-    SetConfig { id: String, value: String, reply: Reply },
-    Decide { id: u64, option: Option<String>, reply: Reply },
-    Delete { id: String, reply: Reply },
+    Compact {
+        reply: Reply,
+    },
+    Cancel {
+        reply: Reply,
+    },
+    SetMode {
+        mode_id: String,
+        reply: Reply,
+    },
+    SetConfig {
+        id: String,
+        value: String,
+        reply: Reply,
+    },
+    Decide {
+        id: u64,
+        option: Option<String>,
+        reply: Reply,
+    },
+    Delete {
+        id: String,
+        reply: Reply,
+    },
     Shutdown,
 }
 
@@ -430,7 +460,8 @@ impl AgentState {
     }
 
     pub async fn set_mode(&self, mode_id: String) -> Result<(), String> {
-        self.roundtrip(|reply| Cmd::SetMode { mode_id, reply }).await
+        self.roundtrip(|reply| Cmd::SetMode { mode_id, reply })
+            .await
     }
 
     pub async fn set_config(&self, id: String, value: String) -> Result<(), String> {
@@ -622,9 +653,9 @@ async fn run_connection(
                     if let Some(option_id) = verdict.allow_once.clone() {
                         let spawned = connection.spawn(async move {
                             let _ = responder.respond(RequestPermissionResponse::new(
-                                RequestPermissionOutcome::Selected(
-                                    SelectedPermissionOutcome::new(option_id),
-                                ),
+                                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                    option_id,
+                                )),
                             ));
                             Ok(())
                         });
@@ -686,7 +717,8 @@ async fn run_connection(
                 if matches!(cmd, Cmd::Shutdown) {
                     return Ok(());
                 }
-                if let Err(error) = dispatch(shared.clone(), &connection, &mut session_id, cmd).await
+                if let Err(error) =
+                    dispatch(shared.clone(), &connection, &mut session_id, cmd).await
                 {
                     return Err(error);
                 }
@@ -728,9 +760,7 @@ async fn initialize(
         shared.window.store(size, Ordering::Relaxed);
     }
     let prompt_image = response.agent_capabilities.prompt_capabilities.image;
-    shared
-        .prompt_image
-        .store(prompt_image, Ordering::Relaxed);
+    shared.prompt_image.store(prompt_image, Ordering::Relaxed);
     emit(
         &shared,
         json!({
@@ -851,13 +881,7 @@ async fn dispatch(
             reply,
         } => {
             run_prompt(
-                shared,
-                connection,
-                session_id,
-                text,
-                files,
-                image_ids,
-                reply,
+                shared, connection, session_id, text, files, image_ids, reply,
             )
             .await
         }
@@ -908,7 +932,8 @@ async fn dispatch(
                         reply.send(Ok(()));
                     } else {
                         reply.send(Err(
-                            "モードの変更を確認できませんでした。表示は届いた通知に合わせます".into(),
+                            "モードの変更を確認できませんでした。表示は届いた通知に合わせます"
+                                .into(),
                         ));
                     }
                     Ok(())
@@ -1267,7 +1292,13 @@ fn handle_notification(shared: &Shared, notification: AgentNotification) {
     }
 }
 
-fn emit_chunk(shared: &Shared, session_id: &str, role: &str, text: &str, message_id: Option<String>) {
+fn emit_chunk(
+    shared: &Shared,
+    session_id: &str,
+    role: &str,
+    text: &str,
+    message_id: Option<String>,
+) {
     if text.is_empty() {
         return;
     }
@@ -1341,10 +1372,7 @@ async fn publish_sessions(
             None => break,
         }
     }
-    emit(
-        &shared,
-        json!({ "type": "sessions", "sessions": sessions }),
-    );
+    emit(&shared, json!({ "type": "sessions", "sessions": sessions }));
     Ok(())
 }
 
@@ -1470,7 +1498,8 @@ fn grok_dir() -> PathBuf {
 fn delete_session_cli(id: &str) -> Result<(), String> {
     let mut cmd = Command::new("grok");
     crate::orchestra::runner::no_window(&mut cmd);
-    let output = cmd.args(["sessions", "delete", id])
+    let output = cmd
+        .args(["sessions", "delete", id])
         .output()
         .map_err(|error| format!("削除コマンドを起動できませんでした: {error}"))?;
     if output.status.success() {
@@ -1478,7 +1507,9 @@ fn delete_session_cli(id: &str) -> Result<(), String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(format!("セッションを削除できませんでした。{stderr}{stdout}"))
+        Err(format!(
+            "セッションを削除できませんでした。{stderr}{stdout}"
+        ))
     }
 }
 
@@ -1537,10 +1568,7 @@ fn publish_replay(shared: &Shared, batch: Vec<Value>) {
     if batch.is_empty() {
         return;
     }
-    publish(
-        &shared.app,
-        json!({ "type": "replay", "events": batch }),
-    );
+    publish(&shared.app, json!({ "type": "replay", "events": batch }));
 }
 
 fn finish_replay(shared: &Shared) {

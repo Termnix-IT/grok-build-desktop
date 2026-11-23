@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use agent_client_protocol::schema::v1::{ContentBlock, ImageContent, ResourceLink, TextContent};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value};
 
 pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
@@ -76,7 +76,12 @@ fn as_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
-        .or_else(|| value.as_f64().filter(|n| n.is_finite() && *n >= 0.0).map(|n| n as u64))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as u64)
+        })
 }
 
 /// Context occupancy uses input tokens when the turn reports them.
@@ -133,15 +138,17 @@ pub fn free_percent(used: u64, size: u64) -> u64 {
 }
 
 /// `/compact` and `/context` on stdio can finish immediately with no agent text.
-pub fn turn_reported_nothing(usage: Option<&TurnUsage>, saw_compaction: bool, saw_agent_text: bool) -> bool {
+pub fn turn_reported_nothing(
+    usage: Option<&TurnUsage>,
+    saw_compaction: bool,
+    saw_agent_text: bool,
+) -> bool {
     if saw_compaction || saw_agent_text {
         return false;
     }
     match usage {
         None => true,
-        Some(usage) => {
-            usage.total_tokens.unwrap_or(0) == 0 && usage.input_tokens.unwrap_or(0) == 0
-        }
+        Some(usage) => usage.total_tokens.unwrap_or(0) == 0 && usage.input_tokens.unwrap_or(0) == 0,
     }
 }
 
@@ -317,7 +324,11 @@ pub fn parse_active_sessions(bytes: &[u8]) -> Vec<ActiveSession> {
         .filter_map(|item| {
             let session_id = item.get("session_id")?.as_str()?.to_string();
             let pid = as_u64(item.get("pid")?)?;
-            let cwd = item.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
+            let cwd = item
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             Some(ActiveSession {
                 session_id,
                 pid: pid as u32,
@@ -332,9 +343,9 @@ pub fn foreign_owner<'a>(
     session_id: &str,
     our_pid: Option<u32>,
 ) -> Option<&'a ActiveSession> {
-    sessions.iter().find(|session| {
-        session.session_id == session_id && Some(session.pid) != our_pid
-    })
+    sessions
+        .iter()
+        .find(|session| session.session_id == session_id && Some(session.pid) != our_pid)
 }
 
 pub fn search_files(root: &Path, query: &str, limit: usize) -> Vec<String> {
@@ -371,7 +382,10 @@ pub fn search_files(root: &Path, query: &str, limit: usize) -> Vec<String> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_lowercase();
-            if needle.is_empty() || relative.contains(&needle) || name.to_lowercase().contains(&needle) {
+            if needle.is_empty()
+                || relative.contains(&needle)
+                || name.to_lowercase().contains(&needle)
+            {
                 out.push(path.to_string_lossy().to_string());
             }
         }
